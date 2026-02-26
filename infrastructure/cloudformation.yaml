@@ -1,0 +1,301 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Kiro User Activity Analytics Infrastructure'
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: S3 bucket containing Kiro user activity reports
+  S3Prefix:
+    Type: String
+    Default: 'amazon-q-developer/'
+    Description: S3 prefix for reports
+  GlueDatabaseName:
+    Type: String
+    Default: 'kiro_analytics'
+    Description: Glue database name
+  IdentityStoreId:
+    Type: String
+    Description: IAM Identity Center Identity Store ID (e.g. d-xxxxxxxxxx)
+
+Resources:
+  # Glue Database
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: 'Kiro user activity analytics database'
+
+  # Glue Crawler - 详细行为数据 (by_user_analytic)
+  GlueCrawlerAnalytic:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: kiro-analytic-crawler
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      TablePrefix: ''
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${S3BucketName}/${S3Prefix}AWSLogs/${AWS::AccountId}/KiroLogs/by_user_analytic/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Schedule:
+        ScheduleExpression: 'cron(0 2 * * ? *)'
+      Configuration: '{"Version":1.0,"Grouping":{"TableGroupingPolicy":"CombineCompatibleSchemas"}}'
+
+  # Glue Crawler - 用户汇总数据 (user_report)
+  GlueCrawlerUserReport:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: kiro-user-report-crawler
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      TablePrefix: ''
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${S3BucketName}/${S3Prefix}AWSLogs/${AWS::AccountId}/KiroLogs/user_report/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Schedule:
+        ScheduleExpression: 'cron(0 2 * * ? *)'
+
+  # IAM Role for Glue Crawlers
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+
+  # Athena Workgroup
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: kiro-analytics-workgroup
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${S3BucketName}/athena-results/'
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+
+  # ============================================
+  # User Mapping Lambda - 自动同步用户名映射
+  # ============================================
+  UserMappingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: UserMappingSyncPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:GetWorkGroup
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                  - glue:GetPartition
+                  - glue:BatchGetPartition
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:GetDatabase
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/*'
+              - Effect: Allow
+                Action:
+                  - identitystore:DescribeUser
+                  - identitystore:ListUsers
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: '*'
+
+  UserMappingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: kiro-user-mapping-sync
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt UserMappingLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref S3BucketName
+          GLUE_DATABASE: !Ref GlueDatabaseName
+          IDENTITY_STORE_ID: !Ref IdentityStoreId
+          ATHENA_WORKGROUP: kiro-analytics-workgroup
+      Code:
+        ZipFile: |
+          import boto3, csv, io, time, os
+
+          BUCKET = os.environ['S3_BUCKET']
+          GLUE_DB = os.environ['GLUE_DATABASE']
+          ID_STORE = os.environ['IDENTITY_STORE_ID']
+          WORKGROUP = os.environ['ATHENA_WORKGROUP']
+          MAPPING_PREFIX = 'user-mapping/'
+          MAPPING_KEY = f'{MAPPING_PREFIX}user_mapping.csv'
+
+          athena = boto3.client('athena')
+          s3 = boto3.client('s3')
+          ids = boto3.client('identitystore')
+          glue = boto3.client('glue')
+
+          def run_query(sql):
+              r = athena.start_query_execution(QueryString=sql, WorkGroup=WORKGROUP)
+              qid = r['QueryExecutionId']
+              while True:
+                  st = athena.get_query_execution(QueryExecutionId=qid)['QueryExecution']['Status']['State']
+                  if st == 'SUCCEEDED': break
+                  elif st == 'FAILED':
+                      reason = athena.get_query_execution(QueryExecutionId=qid)['QueryExecution']['Status'].get('StateChangeReason','')
+                      raise Exception(f'Query failed: {reason}')
+                  time.sleep(2)
+              rows = []
+              paginator = athena.get_paginator('get_query_results')
+              for page in paginator.paginate(QueryExecutionId=qid):
+                  for row in page['ResultSet']['Rows']:
+                      rows.append([col.get('VarCharValue','') for col in row['Data']])
+              return rows[1:]
+
+          def get_name(uid):
+              try:
+                  u = ids.describe_user(IdentityStoreId=ID_STORE, UserId=uid)
+                  return u.get('DisplayName','') or u.get('UserName','') or uid
+              except: return uid
+
+          def ensure_table():
+              ti = {
+                  'Name': 'user_mapping',
+                  'StorageDescriptor': {
+                      'Columns': [{'Name':'userid','Type':'string'},{'Name':'username','Type':'string'}],
+                      'Location': f's3://{BUCKET}/{MAPPING_PREFIX}',
+                      'InputFormat': 'org.apache.hadoop.mapred.TextInputFormat',
+                      'OutputFormat': 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat',
+                      'SerdeInfo': {'SerializationLibrary':'org.apache.hadoop.hive.serde2.OpenCSVSerde',
+                                    'Parameters':{'separatorChar':',','quoteChar':'"','escapeChar':'\\'}}
+                  },
+                  'TableType': 'EXTERNAL_TABLE',
+                  'Parameters': {'skip.header.line.count':'1','classification':'csv'}
+              }
+              try: glue.create_table(DatabaseName=GLUE_DB, TableInput=ti)
+              except glue.exceptions.AlreadyExistsException: glue.update_table(DatabaseName=GLUE_DB, TableInput=ti)
+
+          def handler(event, context):
+              print(f'Starting sync: DB={GLUE_DB}, IDStore={ID_STORE}')
+              raw_ids = set()
+              for t in ['by_user_analytic','user_report']:
+                  try:
+                      rows = run_query(f'SELECT DISTINCT userid FROM {GLUE_DB}.{t}')
+                      print(f'  {t}: {len(rows)} userids')
+                      for row in rows:
+                          if row[0]: raw_ids.add(row[0])
+                  except Exception as e: print(f'Skip {t}: {e}')
+              mapping = []
+              for raw in sorted(raw_ids):
+                  clean = raw.strip('"').strip()
+                  if clean:
+                      mapping.append((raw, get_name(clean)))
+              buf = io.StringIO()
+              w = csv.writer(buf)
+              w.writerow(['userid','username'])
+              for uid, name in mapping: w.writerow([uid, name])
+              s3.put_object(Bucket=BUCKET, Key=MAPPING_KEY, Body=buf.getvalue().encode('utf-8'), ContentType='text/csv')
+              ensure_table()
+              print(f'Sync complete: {len(mapping)} users')
+              return {'users': len(mapping)}
+
+  # EventBridge 定时触发 - 每天 UTC 3:00 (爬虫 2:00 后)
+  UserMappingScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: kiro-user-mapping-daily-sync
+      Description: Daily sync of user ID to display name mapping
+      ScheduleExpression: 'cron(0 3 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt UserMappingFunction.Arn
+          Id: UserMappingSyncTarget
+
+  UserMappingLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UserMappingFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt UserMappingScheduleRule.Arn
+
+Outputs:
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase
+    Export:
+      Name: KiroAnalyticsDatabase
+
+  GlueCrawlerAnalyticName:
+    Value: !Ref GlueCrawlerAnalytic
+    Export:
+      Name: KiroAnalyticCrawler
+
+  GlueCrawlerUserReportName:
+    Value: !Ref GlueCrawlerUserReport
+    Export:
+      Name: KiroUserReportCrawler
+
+  AthenaWorkgroupName:
+    Value: !Ref AthenaWorkgroup
+    Export:
+      Name: KiroAnalyticsWorkgroup
+
+  UserMappingFunctionArn:
+    Value: !GetAtt UserMappingFunction.Arn
+    Export:
+      Name: KiroUserMappingFunction

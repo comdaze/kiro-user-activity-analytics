@@ -1,0 +1,15 @@
+{
+  "name": "Kiro管理概览",
+  "description": "Credit 消耗、用户活跃度、订阅分布",
+  "data_source": "user_report (credits 数据集)",
+  "visuals": [
+    {"type": "KPI", "title": "总活跃用户", "metric": "DISTINCT_COUNT(userid)"},
+    {"type": "KPI", "title": "总 Credit 消耗", "metric": "SUM(credits_used)"},
+    {"type": "KPI", "title": "超额 Credit", "metric": "SUM(overage_credits_used)"},
+    {"type": "KPI", "title": "总消息数", "metric": "SUM(total_messages)"},
+    {"type": "LineChart", "title": "每日 Credit 消耗趋势", "x": "date", "y": ["SUM(credits_used)", "SUM(overage_credits_used)"]},
+    {"type": "BarChart", "title": "Top 10 Credit 消耗用户", "x": "userid", "y": "SUM(credits_used)", "limit": 10},
+    {"type": "BarChart", "title": "各订阅层级用户数", "x": "subscription_tier", "y": "DISTINCT_COUNT(userid)"},
+    {"type": "BarChart", "title": "客户端类型分布", "x": "client_type", "y": "DISTINCT_COUNT(userid)"}
+  ]
+}

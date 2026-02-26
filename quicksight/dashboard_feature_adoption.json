@@ -1,0 +1,14 @@
+{
+  "name": "Kiro功能采用",
+  "description": "各功能模块使用趋势：Dev Agent、测试生成、代码审查、CodeFix、InlineChat、文档生成、代码转换",
+  "data_source": "by_user_analytic (行为数据集)",
+  "visuals": [
+    {"type": "LineChart", "title": "Dev Agent 使用趋势", "x": "date", "y": ["SUM(dev_generationeventcount)", "SUM(dev_acceptanceeventcount)"]},
+    {"type": "LineChart", "title": "测试生成趋势", "x": "date", "y": ["SUM(testgeneration_eventcount)", "SUM(testgeneration_acceptedtests)"]},
+    {"type": "LineChart", "title": "代码审查趋势", "x": "date", "y": ["SUM(codereview_succeededeventcount)", "SUM(codereview_findingscount)"]},
+    {"type": "LineChart", "title": "CodeFix 趋势", "x": "date", "y": ["SUM(codefix_generationeventcount)", "SUM(codefix_acceptanceeventcount)"]},
+    {"type": "LineChart", "title": "InlineChat 使用趋势", "x": "date", "y": ["SUM(inlinechat_totaleventcount)", "SUM(inlinechat_acceptanceeventcount)"]},
+    {"type": "LineChart", "title": "文档生成趋势", "x": "date", "y": ["SUM(docgeneration_eventcount)", "SUM(docgeneration_acceptedfilescreations)"]},
+    {"type": "LineChart", "title": "代码转换趋势", "x": "date", "y": ["SUM(transformation_eventcount)", "SUM(transformation_linesgenerated)"]}
+  ]
+}

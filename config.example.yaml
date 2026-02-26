@@ -1,0 +1,41 @@
+# AWS 配置
+aws:
+  region: us-east-1
+  account_id: "YOUR_ACCOUNT_ID"
+
+# S3 配置
+s3:
+  bucket_name: "your-kiro-reports-bucket"
+  prefix: "amazon-q-developer/"
+
+# Glue 配置
+glue:
+  database_name: "kiro_analytics"
+  crawlers:
+    analytic:
+      name: "kiro-analytic-crawler"
+      table_name: "by_user_analytic"
+    user_report:
+      name: "kiro-user-report-crawler"
+      table_name: "user_report"
+
+# IAM Identity Center 配置
+identity_center:
+  identity_store_id: "your-identity-store-id"
+
+# QuickSight 配置
+quicksight:
+  user_arn: "arn:aws:quicksight:us-east-1:YOUR_ACCOUNT_ID:user/default/YOUR_USERNAME"
+  data_source_name: "KiroUserActivity"
+  dataset_name: "KiroUserActivityDataset"
+  
+  # 仪表板配置
+  dashboards:
+    - name: "Kiro管理概览"
+      id: "kiro-admin-overview"
+    - name: "Kiro用户行为分析"
+      id: "kiro-user-behavior"
+    - name: "Kiro成本优化"
+      id: "kiro-cost-optimization"
+    - name: "Kiro功能采用"
+      id: "kiro-feature-adoption"
