@@ -260,77 +260,21 @@ class QuickSightDeployer:
             print(f"✓ Credits 数据集已更新 (含用户名)")
         return 'kiro-user-credits-dataset'
     
-    def create_analysis(self, dataset_id, dashboard_config):
-        """创建空白分析，根据仪表板类型绑定不同数据集"""
-        analysis_id = f"{dashboard_config['id']}-analysis"
-
-        # 管理概览和成本优化用 credits 数据集，其他用行为数据集
-        if dashboard_config['id'] in ('kiro-admin-overview', 'kiro-cost-optimization'):
-            ds_id = 'kiro-user-credits-dataset'
-        else:
-            ds_id = dataset_id
-
-        try:
-            response = self.qs.create_analysis(
-                AwsAccountId=self.account_id,
-                AnalysisId=analysis_id,
-                Name=f"{dashboard_config['name']}",
-                Definition={
-                    'DataSetIdentifierDeclarations': [{
-                        'Identifier': 'dataset1',
-                        'DataSetArn': f"arn:aws:quicksight:{self.config['aws']['region']}:{self.account_id}:dataset/{ds_id}"
-                    }],
-                    'Sheets': [{
-                        'SheetId': 'sheet1',
-                        'Name': 'Sheet 1',
-                        'Visuals': []
-                    }]
-                },
-                Permissions=[{
-                    'Principal': self.config['quicksight']['user_arn'],
-                    'Actions': [
-                        'quicksight:RestoreAnalysis',
-                        'quicksight:UpdateAnalysisPermissions',
-                        'quicksight:DeleteAnalysis',
-                        'quicksight:DescribeAnalysisPermissions',
-                        'quicksight:QueryAnalysis',
-                        'quicksight:DescribeAnalysis',
-                        'quicksight:UpdateAnalysis'
-                    ]
-                }]
-            )
-            print(f"✓ 分析创建成功: {dashboard_config['name']}")
-            return analysis_id
-        except self.qs.exceptions.ResourceExistsException:
-            print(f"✓ 分析已存在: {dashboard_config['name']}")
-            return analysis_id
-        except Exception as e:
-            print(f"✗ 创建分析失败 {dashboard_config['name']}: {e}")
-            return None
     
     
     def deploy_all(self):
         """部署所有资源"""
         print("开始部署 QuickSight 资源...\n")
-        
+
         # 1. 创建数据源
         data_source_id = self.create_data_source()
-        
+
         # 2. 创建数据集
         dataset_id = self.create_dataset(data_source_id)
         credits_dataset_id = self.create_credits_dataset(data_source_id)
-        
-        # 3. 创建分析（仪表板）
-        print("\n创建分析...")
-        for dashboard in self.config['quicksight']['dashboards']:
-            self.create_analysis(dataset_id, dashboard)
-        
-        print("\n✓ 部署完成！")
+
+        print("\n✓ 数据源和数据集部署完成！")
         print(f"\n访问 QuickSight 控制台查看: https://{self.config['aws']['region']}.quicksight.aws.amazon.com/")
-        print("\n已创建的分析：")
-        for dashboard in self.config['quicksight']['dashboards']:
-            print(f"  - {dashboard['name']}")
-        print("\n在 QuickSight 中打开分析，添加可视化图表即可。")
 
 if __name__ == '__main__':
     deployer = QuickSightDeployer()

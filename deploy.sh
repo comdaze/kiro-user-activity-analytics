@@ -38,6 +38,20 @@ echo ""
 # 1. 部署 CloudFormation
 # ============================================
 echo "1️⃣  部署基础设施 (CloudFormation)..."
+
+# 检查 stack 是否处于 ROLLBACK_COMPLETE 等不可更新状态，自动清理
+STACK_STATUS=$(aws cloudformation describe-stacks \
+    --stack-name $STACK_NAME \
+    --region $REGION \
+    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "NOT_FOUND")
+
+if [ "$STACK_STATUS" = "ROLLBACK_COMPLETE" ] || [ "$STACK_STATUS" = "DELETE_FAILED" ]; then
+    echo "  ⚠️  Stack 处于 $STACK_STATUS 状态，自动删除后重建..."
+    aws cloudformation delete-stack --stack-name $STACK_NAME --region $REGION
+    aws cloudformation wait stack-delete-complete --stack-name $STACK_NAME --region $REGION
+    echo "  ✓ 旧 Stack 已删除"
+fi
+
 aws cloudformation deploy \
     --template-file infrastructure/cloudformation.yaml \
     --stack-name $STACK_NAME \
@@ -200,18 +214,39 @@ echo "✓ Crawlers 全部完成"
 echo ""
 
 # ============================================
-# 4. 验证 Athena 数据查询
+# 4. 验证 Athena 数据查询（含重试，等待表可用）
 # ============================================
 echo "4️⃣  验证 Athena 数据查询..."
 
 python3 -c "
 import boto3, time, sys
 athena = boto3.client('athena', region_name='$REGION')
+glue = boto3.client('glue', region_name='$REGION')
 tables = ['by_user_analytic', 'user_report']
+max_retries = 6
 ok = True
+
 for t in tables:
+    # 先等 Glue 表存在
+    for attempt in range(max_retries):
+        try:
+            glue.get_table(DatabaseName='$GLUE_DB', Name=t)
+            break
+        except glue.exceptions.EntityNotFoundException:
+            if attempt < max_retries - 1:
+                print(f'  ⏳ 等待表 {t} 创建... ({attempt+1}/{max_retries})')
+                time.sleep(10)
+            else:
+                print(f'  ✗ {t}: 表不存在，Crawler 可能未正确创建')
+                ok = False
+                continue
+
+    if not ok:
+        continue
+
+    # 查询验证
     r = athena.start_query_execution(
-        QueryString=f'SELECT COUNT(*) FROM kiro_analytics.{t}',
+        QueryString=f'SELECT COUNT(*) FROM $GLUE_DB.{t}',
         WorkGroup='$WORKGROUP')
     qid = r['QueryExecutionId']
     while True:
@@ -251,20 +286,13 @@ echo ""
 # 7. 部署 QuickSight 数据源和数据集
 # ============================================
 echo "7️⃣  部署 QuickSight 数据源和数据集..."
-python3 scripts/create_dashboards.py
+python3 scripts/create_datasets.py
 echo ""
 
 # ============================================
-# 8. 部署 QuickSight 可视化分析
+# 8. 发布 QuickSight Dashboard
 # ============================================
-echo "8️⃣  部署 QuickSight 可视化分析..."
-python3 scripts/create_visuals.py
-echo ""
-
-# ============================================
-# 9. 发布 QuickSight Dashboard
-# ============================================
-echo "9️⃣  发布 QuickSight Dashboard..."
+echo "8️⃣  发布 QuickSight Dashboard..."
 python3 scripts/create_dashboard_publish.py
 echo ""
 

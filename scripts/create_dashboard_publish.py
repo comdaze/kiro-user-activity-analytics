@@ -232,5 +232,34 @@ try:
 except Exception as e:
     print(f"  发布版本跳过: {e}")
 
+# ============================================
+# 创建或更新 Analysis（用于在控制台可视化编辑）
+# ============================================
+ANALYSIS_ID = 'kiro-comprehensive-analysis'
+ANALYSIS_NAME = 'Kiro 综合分析'
+
+analysis_perms = [{
+    'Principal': user_arn,
+    'Actions': [
+        'quicksight:RestoreAnalysis', 'quicksight:UpdateAnalysisPermissions',
+        'quicksight:DeleteAnalysis', 'quicksight:DescribeAnalysisPermissions',
+        'quicksight:QueryAnalysis', 'quicksight:DescribeAnalysis',
+        'quicksight:UpdateAnalysis'
+    ]
+}]
+
+try:
+    qs.create_analysis(
+        AwsAccountId=aid, AnalysisId=ANALYSIS_ID, Name=ANALYSIS_NAME,
+        Definition=definition, Permissions=analysis_perms
+    )
+    print(f"✓ Analysis 创建成功: {ANALYSIS_NAME}")
+except qs.exceptions.ResourceExistsException:
+    qs.update_analysis(
+        AwsAccountId=aid, AnalysisId=ANALYSIS_ID, Name=ANALYSIS_NAME,
+        Definition=definition
+    )
+    print(f"✓ Analysis 已更新: {ANALYSIS_NAME}")
+
 print(f"\n✅ 综合仪表板部署完成！")
 print(f"访问: https://{region}.quicksight.aws.amazon.com/sn/dashboards/{DASHBOARD_ID}")
