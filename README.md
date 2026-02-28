@@ -13,7 +13,7 @@ Kiro 企业版用户活动数据分析平台。自动采集 S3 中的用户报�
                            ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  S3 Bucket                                                              │
-│  s3://<bucket>/amazon-q-developer/AWSLogs/<account>/KiroLogs/           │
+│  s3://<bucket>/<prefix>/AWSLogs/<account>/KiroLogs/           │
 │  ├── by_user_analytic/   每日用户行为明细 (46 列)                         │
 │  │   └── <region>/<year>/<month>/<day>/00/*.csv                         │
 │  ├── user_report/        每日用户 Credit 汇总 (11 列)                    │
@@ -84,8 +84,33 @@ Kiro 企业版用户活动数据分析平台。自动采集 S3 中的用户报�
 4. 点击 **Enable** 开启报告
 5. 配置 S3 存储桶：
    - 选择一个已有的 S3 桶，或创建新桶
-   - 记录桶名称（如 `q-developer-reports-xxxxxxxx`）
-   - 报告会自动投递到 `s3://<bucket>/amazon-q-developer/AWSLogs/<account_id>/KiroLogs/` 路径下
+   - 记录桶名称（如 `kiro-user-reports-xxxxxxxx`）
+   - 报告会自动投递到 `s3://<bucket>/<prefix>/AWSLogs/<account_id>/KiroLogs/` 路径下
+   - 确认 S3 桶策略包含 Kiro 服务写入权限：
+     ```json
+     {
+       "Version": "2012-10-17",
+       "Statement": [
+         {
+           "Sid": "KiroLogsWrite",
+           "Effect": "Allow",
+           "Principal": {
+             "Service": "q.amazonaws.com"
+           },
+           "Action": "s3:PutObject",
+           "Resource": "arn:aws:s3:::<bucket-name>/<prefix>/*",
+           "Condition": {
+             "StringEquals": {
+               "aws:SourceAccount": "<account-id>"
+             },
+             "ArnLike": {
+               "aws:SourceArn": "arn:aws:codewhisperer:<region>:<account-id>:*"
+             }
+           }
+         }
+       ]
+     }
+     ```
 6. 等待至少 1-2 天，确认 S3 中有数据生成
 
 > **注意**: 报告有 1-2 天的延迟。开启后第二天才会看到第一份报告。
@@ -95,8 +120,9 @@ Kiro 企业版用户活动数据分析平台。自动采集 S3 中的用户报�
 - **AWS CLI** 已安装并配置，当前用户有管理员权限
 - **Python 3.9+** 已安装
 - **QuickSight Enterprise** 已在当前 Region 启用
+- **QuickSight S3 权限（重要！！）**）: 在 QuickSight Console → Manage QuickSight → Security & permissions → S3 中，勾选报告所在的 S3 bucket，并启用 "Write permission for Athena Workgroup"
 - **IAM Identity Center** 已配置（用于将 userid 映射为可读的用户名）
-- **Lake Formation** 已启用（项目会自动配置所需权限）
+- **Lake Formation（重要！！）**: 当前用户需要是 Data Lake Admin（部署脚本会自动配置表权限）
 
 ## 快速开始
 
@@ -332,10 +358,12 @@ GROUP BY userid;
 |------|---------|
 | Athena 查询报 `AccessDeniedException` | 检查 Lake Formation 权限，重新运行 `deploy.sh` 的第 2 步 |
 | Crawler 运行失败 | 检查 S3 桶策略是否允许 Glue Crawler Role 访问 |
-| QuickSight 数据集报错 | 确认 QuickSight Service Role 和用户 IAM 角色都有 Lake Formation 权限 |
+| QuickSight 报 `SQL exception` | 确认 QuickSight 已授权访问 S3 bucket（Manage QuickSight → Security & permissions → S3），并确认当前用户是 Lake Formation Data Lake Admin |
+| QuickSight 数据源 `CREATION_FAILED` | 通常是 S3 权限问题，在 QuickSight Console 授权 S3 后删除数据源重建：`sh deploy.sh --from-step 7` |
 | 用户名显示为 UUID | 运行 `python3 scripts/sync_user_mapping.py` 手动同步映射 |
 | 仪表板图表为空 | 检查 Athena 表是否有数据：`SELECT COUNT(*) FROM kiro_analytics.user_report` |
 | S3 没有新数据 | 报告有 1-2 天延迟，确认 Kiro User Activity Report 已开启 |
+| CloudFormation 部署报 `ROLLBACK_COMPLETE` | deploy.sh 会自动处理，删除旧 stack 后重建 |
 
 ## License
 

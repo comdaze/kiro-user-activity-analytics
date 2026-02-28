@@ -1,7 +1,19 @@
 #!/bin/bash
 set -e
 
+# 支持 --from-step N 从第 N 步开始执行
+FROM_STEP=1
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --from-step) FROM_STEP=$2; shift 2;;
+        *) echo "用法: $0 [--from-step N]  (N=1~8)"; exit 1;;
+    esac
+done
+
 echo "🚀 开始部署 Kiro User Activity Analytics"
+if [ "$FROM_STEP" -gt 1 ]; then
+    echo "  ⏩ 从第 ${FROM_STEP} 步开始"
+fi
 echo ""
 
 # ============================================
@@ -37,6 +49,7 @@ echo ""
 # ============================================
 # 1. 部署 CloudFormation
 # ============================================
+if [ "$FROM_STEP" -le 1 ]; then
 echo "1️⃣  部署基础设施 (CloudFormation)..."
 
 # 检查 stack 是否处于 ROLLBACK_COMPLETE 等不可更新状态，自动清理
@@ -65,20 +78,13 @@ aws cloudformation deploy \
 
 echo "✓ CloudFormation 部署完成"
 echo ""
+fi # step 1
 
 # ============================================
 # 2. 配置 Lake Formation 权限
 # ============================================
-echo "2️⃣  配置 Lake Formation 权限..."
 
-CRAWLER_ROLE_NAME=$(aws cloudformation describe-stack-resource \
-    --stack-name $STACK_NAME \
-    --logical-resource-id GlueCrawlerRole \
-    --region $REGION \
-    --query 'StackResourceDetail.PhysicalResourceId' --output text)
-CRAWLER_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${CRAWLER_ROLE_NAME}"
-CALLER_ARN=$(aws sts get-caller-identity --query 'Arn' --output text)
-
+# Lake Formation 授权辅助函数（全局定义，供多个步骤使用）
 grant_lf() {
     local PRINCIPAL=$1
     local RESOURCE=$2
@@ -91,22 +97,40 @@ grant_lf() {
         --region $REGION 2>/dev/null && echo "  ✓ $DESC" || echo "  ✓ $DESC (已存在)"
 }
 
+# 逐表授权（兼容不支持 TableWildcard 的环境）
+grant_lf_all_tables() {
+    local PRINCIPAL=$1
+    local PERMS=$2
+    local DESC=$3
+    for TABLE in by_user_analytic user_report user_mapping; do
+        grant_lf "$PRINCIPAL" \
+            "{\"Table\":{\"DatabaseName\":\"$GLUE_DB\",\"Name\":\"$TABLE\"}}" \
+            "$PERMS" \
+            "$DESC ($TABLE)"
+    done
+}
+
+if [ "$FROM_STEP" -le 2 ]; then
+echo "2️⃣  配置 Lake Formation 权限..."
+
+CRAWLER_ROLE_NAME=$(aws cloudformation describe-stack-resource \
+    --stack-name $STACK_NAME \
+    --logical-resource-id GlueCrawlerRole \
+    --region $REGION \
+    --query 'StackResourceDetail.PhysicalResourceId' --output text)
+CRAWLER_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${CRAWLER_ROLE_NAME}"
+CALLER_ARN=$(aws sts get-caller-identity --query 'Arn' --output text)
+
 # Crawler: 建表权限
 grant_lf "$CRAWLER_ROLE_ARN" \
     "{\"Database\":{\"Name\":\"$GLUE_DB\"}}" \
     "CREATE_TABLE ALTER DROP" \
     "Crawler 数据库权限"
 
-grant_lf "$CRAWLER_ROLE_ARN" \
-    "{\"Table\":{\"DatabaseName\":\"$GLUE_DB\",\"TableWildcard\":{}}}" \
-    "ALL" \
-    "Crawler 表权限"
+grant_lf_all_tables "$CRAWLER_ROLE_ARN" "ALL" "Crawler 表权限"
 
 # 当前用户: Athena 查询权限
-grant_lf "$CALLER_ARN" \
-    "{\"Table\":{\"DatabaseName\":\"$GLUE_DB\",\"TableWildcard\":{}}}" \
-    "SELECT DESCRIBE" \
-    "当前用户查询权限"
+grant_lf_all_tables "$CALLER_ARN" "SELECT DESCRIBE" "当前用户查询权限"
 
 # QuickSight: 读取权限
 grant_lf "$QS_ROLE_ARN" \
@@ -114,10 +138,7 @@ grant_lf "$QS_ROLE_ARN" \
     "DESCRIBE" \
     "QuickSight 数据库权限"
 
-grant_lf "$QS_ROLE_ARN" \
-    "{\"Table\":{\"DatabaseName\":\"$GLUE_DB\",\"TableWildcard\":{}}}" \
-    "SELECT DESCRIBE" \
-    "QuickSight 表权限"
+grant_lf_all_tables "$QS_ROLE_ARN" "SELECT DESCRIBE" "QuickSight 表权限"
 
 # QuickSight 用户 IAM 角色: 从 user_arn 中提取角色名并授权
 QS_IAM_ROLE=$(python3 -c "
@@ -135,10 +156,7 @@ if [ -n "$QS_IAM_ROLE" ]; then
         "DESCRIBE" \
         "QuickSight 用户角色数据库权限"
 
-    grant_lf "$QS_IAM_ROLE" \
-        "{\"Table\":{\"DatabaseName\":\"$GLUE_DB\",\"TableWildcard\":{}}}" \
-        "SELECT DESCRIBE" \
-        "QuickSight 用户角色表权限"
+    grant_lf_all_tables "$QS_IAM_ROLE" "SELECT DESCRIBE" "QuickSight 用户角色表权限"
 fi
 
 # IAMAllowedPrincipals: 回退到 IAM 模式，确保所有有 IAM 权限的角色都能访问
@@ -147,10 +165,7 @@ grant_lf "IAM_ALLOWED_PRINCIPALS" \
     "ALL" \
     "IAMAllowedPrincipals 数据库权限"
 
-grant_lf "IAM_ALLOWED_PRINCIPALS" \
-    "{\"Table\":{\"DatabaseName\":\"$GLUE_DB\",\"TableWildcard\":{}}}" \
-    "ALL" \
-    "IAMAllowedPrincipals 表权限"
+grant_lf_all_tables "IAM_ALLOWED_PRINCIPALS" "ALL" "IAMAllowedPrincipals 表权限"
 
 # Lambda 用户映射同步: 查询和建表权限
 LAMBDA_ROLE_FULL_ARN=$(aws lambda get-function-configuration \
@@ -161,18 +176,17 @@ if [ -n "$LAMBDA_ROLE_FULL_ARN" ] && [ "$LAMBDA_ROLE_FULL_ARN" != "None" ]; then
         "{\"Database\":{\"Name\":\"$GLUE_DB\"}}" \
         "CREATE_TABLE ALTER DESCRIBE" \
         "Lambda 数据库权限"
-    grant_lf "$LAMBDA_ROLE_FULL_ARN" \
-        "{\"Table\":{\"DatabaseName\":\"$GLUE_DB\",\"TableWildcard\":{}}}" \
-        "SELECT DESCRIBE ALTER" \
-        "Lambda 表权限"
+    grant_lf_all_tables "$LAMBDA_ROLE_FULL_ARN" "SELECT DESCRIBE ALTER" "Lambda 表权限"
 fi
 
 echo "✓ Lake Formation 权限配置完成"
 echo ""
+fi # step 2
 
 # ============================================
 # 3. 运行 Glue Crawlers
 # ============================================
+if [ "$FROM_STEP" -le 3 ]; then
 echo "3️⃣  运行 Glue Crawlers..."
 
 CRAWLER_ANALYTIC=$(aws cloudformation describe-stacks \
@@ -212,10 +226,12 @@ done
 
 echo "✓ Crawlers 全部完成"
 echo ""
+fi # step 3
 
 # ============================================
 # 4. 验证 Athena 数据查询（含重试，等待表可用）
 # ============================================
+if [ "$FROM_STEP" -le 4 ]; then
 echo "4️⃣  验证 Athena 数据查询..."
 
 python3 -c "
@@ -267,34 +283,50 @@ if not ok:
 
 echo "✓ 数据验证通过"
 echo ""
+fi # step 4
 
 # ============================================
 # 5. 创建 Athena 视图
 # ============================================
+if [ "$FROM_STEP" -le 5 ]; then
 echo "5️⃣  创建 Athena 视图..."
 python3 scripts/create_views.py
 echo ""
+fi # step 5
 
 # ============================================
 # 6. 同步用户映射 (Identity Center → S3 → Athena)
 # ============================================
+if [ "$FROM_STEP" -le 6 ]; then
 echo "6️⃣  同步用户名映射..."
 python3 scripts/sync_user_mapping.py
+
+# user_mapping 表是新建的，需要补授 Lake Formation 权限
+echo "  补授 user_mapping 表 Lake Formation 权限..."
+grant_lf "IAM_ALLOWED_PRINCIPALS" \
+    "{\"Table\":{\"DatabaseName\":\"$GLUE_DB\",\"Name\":\"user_mapping\"}}" \
+    "ALL" \
+    "IAMAllowedPrincipals user_mapping 权限"
 echo ""
+fi # step 6
 
 # ============================================
 # 7. 部署 QuickSight 数据源和数据集
 # ============================================
+if [ "$FROM_STEP" -le 7 ]; then
 echo "7️⃣  部署 QuickSight 数据源和数据集..."
 python3 scripts/create_datasets.py
 echo ""
+fi # step 7
 
 # ============================================
 # 8. 发布 QuickSight Dashboard
 # ============================================
+if [ "$FROM_STEP" -le 8 ]; then
 echo "8️⃣  发布 QuickSight Dashboard..."
 python3 scripts/create_dashboard_publish.py
 echo ""
+fi # step 8
 
 # ============================================
 # 完成
