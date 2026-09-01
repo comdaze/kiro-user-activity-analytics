@@ -203,13 +203,16 @@ quicksight:
 
 | 步骤 | 说明 | 对应脚本/资源 |
 |------|------|--------------|
-| 1️⃣ | 部署 CloudFormation 基础设施 + 更新 Lambda 代码 | `infrastructure/cloudformation.yaml` |
+| 1️⃣ | 构建 SHA-256 地址化月报 ZIP，上传 S3，并部署 CloudFormation/Lambda/EventBridge/IAM | `lambda/monthly_report/`、`infrastructure/cloudformation.yaml` |
 | 2️⃣ | 配置 Lake Formation 数据库权限 | deploy.sh 内置 |
 | 3️⃣ | 通过 Glue API 创建外部表 + 配置表级别权限 | deploy.sh 内置 |
 | 4️⃣ | 验证 Athena 数据查询 | Athena |
 | 5️⃣ | 同步用户名映射 + 创建 Athena 视图 | `scripts/sync_user_mapping.py` + deploy.sh 内置 |
 | 6️⃣ | 部署 QuickSight 数据源和数据集 (SPICE) | `scripts/create_datasets.py` |
 | 7️⃣ | 发布综合仪表板和分析 | `scripts/create_dashboard.py` |
+| 8️⃣ | 配置每日 Dashboard 快照报告（SES + S3 静态网站） | deploy.sh 内置 |
+
+> `./deploy.sh --from-step N` 可从指定步骤继续。步骤 1 会把本地、未提交的 `config.yaml` 中月报 Secret ARN、Final 通知开关和通道写入 CloudFormation；执行前必须先与 AWS 已部署参数核对，避免把生产 `prod` 通道意外切回 `dev`。
 
 ### Lake Formation 权限
 
@@ -228,20 +231,23 @@ quicksight:
 
 ```
 kiro-user-activity-analytics/
-├── config.yaml                      # 项目配置（包含账户信息，不提交 Git）
-├── config.example.yaml              # 配置模板
-├── deploy.sh                        # 端到端部署脚本
-├── requirements.txt                 # Python 依赖
+├── config.yaml                         # 本地环境配置（Git 忽略，不是生产真值审计记录）
+├── config.example.yaml                 # 无环境、默认关闭通知的安全配置模板
+├── deploy.sh                           # 端到端部署脚本（步骤 1~8）
+├── requirements.txt                    # 主部署/脚本 Python 依赖
 ├── infrastructure/
-│   └── cloudformation.yaml          # AWS 基础设施定义
-│                                    #   - Glue Database
-│                                    #   - Athena Workgroup
-│                                    #   - Lambda 用户映射同步函数
-│                                    #   - EventBridge 定时规则
-└── scripts/
-    ├── sync_user_mapping.py         # 同步 userid → 用户名映射
-    ├── create_datasets.py           # 创建 QuickSight 数据源和数据集 (SPICE)
-    └── create_dashboard.py          # 创建并发布综合仪表板和分析
+│   └── cloudformation.yaml             # Glue、Athena、Lambda、IAM、EventBridge、快照报告
+├── lambda/
+│   └── monthly_report/
+│       ├── index.py                    # 自然月 Credits 月报、Excel、Card 2.0、双通道路由
+│       └── requirements.txt            # 月报 ZIP 精确锁定依赖
+├── scripts/
+│   ├── sync_user_mapping.py            # 同步 userid → 用户名映射并保留最后有效姓名
+│   ├── backfill_monthly_reports.py     # 同步历史月报回填，可显式选择通知通道
+│   ├── create_datasets.py              # 创建 QuickSight 数据源和数据集 (SPICE)
+│   └── create_dashboard.py             # 创建并发布综合仪表板和分析
+└── tests/
+    └── test_monthly_report.py           # 月报、Excel、Card 2.0 和通知路由回归测试
 ```
 
 ## 数据源说明
@@ -284,7 +290,7 @@ kiro-user-activity-analytics/
 
 ## 用户名映射机制
 
-S3 报告中的 `userid` 是 IAM Identity Center 的 UUID（如 `24681498-20e1-7057-3818-19d6b7a2f397`），不便于识别。项目通过以下机制自动映射为可读的用户名：
+S3 报告中的 `userid` 是 IAM Identity Center 的 UUID（如 `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`），不便于识别。项目通过以下机制自动映射为可读的用户名：
 
 1. **Lambda 函数** (`kiro-user-mapping-sync`) 每天 UTC 3:00 自动运行
 2. 从 IAM Identity Center 拉取全部用户列表
@@ -431,7 +437,7 @@ GROUP BY userid;
 ### 已知限制
 
 1. **userid 格式变更（已解决）**: 
-   - **问题**：AWS 在 2026-03-10 改变了 `user_report` 表的 userid 格式，从纯 UUID（如 `f448f448-...`）变为带 Identity Store ID 前缀（如 `d-90661af5ec.f448f448-...`）
+   - **问题**：AWS 在 2026-03-10 改变了 `user_report` 表的 userid 格式，从纯 UUID（如 `f448f448-...`）变为带 Identity Store ID 前缀（如 `d-xxxxxxxxxx.f448f448-...`）
    - **影响**：新格式的 userid 无法与旧的 `user_mapping` 表匹配，导致 Dashboard 显示 null
    - **解决方案**：`sync_user_mapping.py` 和 Lambda 函数已修复，为每个用户生成两种格式的映射记录，确保新旧格式都能正确匹配
 
@@ -488,6 +494,242 @@ AWS 提供两种订阅方式，根据账号所在区域和需求选择：
 > 费用主要来自用户订阅。其他服务（S3、Athena、Lambda、Glue）在本方案的数据规模下费用可忽略不计。
 >
 > 定价参考：[Quick Suite Pricing](https://aws.amazon.com/quick/pricing/)、[QuickSight BI-only Pricing](https://aws.amazon.com/quick/quicksight/pricing/)、[Athena Pricing](https://aws.amazon.com/athena/pricing/)
+
+## 月度 Kiro Credits Excel 报告
+
+月报由独立 Lambda `kiro-monthly-credits-report` 生成，不替换或修改每日 QuickSight/PDF 管道。运行时为 Python 3.12；`deploy.sh` 按 `lambda/monthly_report/requirements.txt` 构建 SHA-256 地址化的不可变 ZIP，并上传到数据桶的 `artifacts/monthly-report/<sha256>.zip`。月报函数预留并发为 1，超时 900 秒，日志保留 90 天。
+
+### 已部署生产基线（截至 2026-08-31）
+
+| 项目 | 已部署值 |
+|------|----------|
+| CloudFormation stack | `kiro-analytics-stack` / `UPDATE_COMPLETE` |
+| Provisional | `cron(0 6 1 * ? *)`、`ENABLED`、`notify=false` |
+| Final | `cron(0 6 2 * ? *)`、`ENABLED`、`notify=true`、`notification_channel=prod` |
+| Secret | `kiro/monthly-report/feishu-bot-dev` 与 `kiro/monthly-report/feishu-bot-prod` 独立存在 |
+| 生产验收范围 | Secret 元数据、Lambda 环境、IAM、EventBridge 输入均已只读验收；切换生产通道时未发送测试消息 |
+
+这张表是带日期的运维快照，不替代 AWS 实际状态。CloudFormation parameters、EventBridge target 和 Lambda environment 才是已部署真值；`config.example.yaml` 只是无环境模板，Git 忽略的 `config.yaml` 是下一次部署输入，不是可靠的生产审计记录。
+
+### 调度、数据范围与输出
+
+- Provisional：每月 1 日 UTC 06:00（北京时间 14:00）生成上一个自然月，EventBridge 明确传入 `notify=false`。
+- Final：每月 2 日 UTC 06:00 生成上一个自然月；是否通知及通道完全由 CloudFormation 参数显式传入。
+- Athena 仅查询 `user_report`，按规范化用户 ID 汇总 Credits，日期使用 `[月初, 下月月初)` 半开区间和 `TRY` 类型转换。
+- 2026-02 标记为 `PARTIAL`，可用数据从 2026-02-10 开始。
+- 历史回填早于“当前上一个自然月”时，不使用当前订阅名册补造历史零使用用户；工作簿会明确提示历史名册无法重建。
+
+输出路径如下，报告桶公开策略仅用于既定报告前缀；原始数据桶不公开：
+
+```text
+dashboard-reports/public/kiro-monthly/YYYY/MM/kiro-credits-YYYY-MM-provisional.xlsx
+dashboard-reports/public/kiro-monthly/YYYY/MM/kiro-credits-YYYY-MM-final.xlsx
+dashboard-reports/public/kiro-monthly/YYYY/MM/kiro-credits-YYYY-MM.xlsx  # Final 稳定别名
+dashboard-reports/public/kiro-monthly/YYYY/MM/kiro-credits-YYYY-MM-detail.csv
+dashboard-reports/public/kiro-monthly/YYYY/MM/kiro-credits-YYYY-MM-subscriptions.csv  # 仅可安全使用当前名册时生成
+dashboard-reports/public/kiro-monthly/YYYY/kiro-credits-YYYY.xlsx
+```
+
+月度持久化文件先写入 S3，再重建年度文件，最后才尝试通知。年度工作簿每次从该年度全部 detail CSV 重建，不增量追加；数值字段保留合法负数，文本字段进行公式注入防护。所有新对象使用 SSE-S3。
+
+### 订阅名册、套餐和身份
+
+优先读取 `monthly_report.subscription_csv_key` 指向的**精确 S3 key**。文件必须是严格 UTF-8（可带 BOM），支持列别名：`userid/user_id`、`user_name/username/name`、`email`、`subscription_status/status`、`subscription_tier/kiro_plan/plan`、`activation_date`、`plan_source/source`。有效的仅表头空 CSV 也具有权威性；相同用户 ID 按最高套餐去重，同时保留非空姓名和邮箱。
+
+精确 key 未配置或不存在时，Lambda 使用 Kiro Application ARN 分页读取 IAM Identity Center Application Assignments，包含直接 USER，并展开 GROUP 成员。套餐组支持 `Kiro-Pro-users`、`Kiro-Pro+-users`、Pro Max 和 Power 规范化；直接分配用户采用最近使用记录中的套餐，无记录时为 Unknown。
+
+套餐容量/价格：Pro `$20/1000`、Pro+ `$40/2000`、Pro Max `$100/5000`、Power `$200/10000`。红色为零使用或 `<10%`，黄色为 `10%-<50%`，绿色为 `>=50%`；`>=90%` 标记容量压力，`>=100%` 标记超过容量。
+
+历史 detail、`user-mapping/user_mapping.csv` 和当前名册只用于姓名/邮箱身份回退；当前名册不会为历史月份补造订阅状态、套餐、激活日期或零使用行。重名用户附加邮箱，无法识别的身份显示用户 ID 后缀。
+
+### Feishu Card JSON 2.0
+
+- 固定企业蓝 Header，KPI/面板使用浅色和深色独立的中性色 token；红/橙仅作为小型风险标签。
+- 语义图标限定为用户、成本、零使用、低用、建议和完整报告，不使用装饰性 Emoji 堆叠。
+- 零使用面板始终展开；总风险 `<=20` 时低用面板展开，`>=21` 时折叠，但用户仍保留在 JSON。
+- 风险人数 `<=24` 使用双列两行明细，`>24` 使用密集两行 Markdown，以降低组件数且不截断用户。
+- Card JSON 2.0 官方客户端要求为 7.20+；PC、iOS、Android 按钮均配置报告 URL。组织实际客户端仍需人工渲染验收。
+- 官方上限为 200 个组件。回归样例验证 32 位全风险用户仍低于 200 组件，常规生产样例低于项目自定 20KB 目标；当前实现没有运行时 payload 字节硬限制。若未来用户名或人数显著增长导致飞书拒绝，S3 报告仍然存在，错误只会体现在 Lambda 响应字段中。
+
+### Secret 创建与安全边界
+
+CloudFormation **不会创建或保存 Webhook**，只接收两个 Secret ARN，并按 ARN 精确授予 `secretsmanager:GetSecretValue`：
+
+- `kiro/monthly-report/feishu-bot-dev`
+- `kiro/monthly-report/feishu-bot-prod`
+
+Secret JSON 支持：
+
+```json
+{"webhook":"https://open.feishu.cn/open-apis/bot/v2/hook/REDACTED","sign_secret":"REDACTED"}
+```
+
+也可用 `url` 替代 `webhook`，`sign_secret` 可省略。推荐通过 AWS Console 输入值；若使用 CLI，应从权限 `0600` 的临时 JSON 文件读取，避免写入 shell history：
+
+```bash
+umask 077
+# 在本机安全编辑 /tmp/feishu-prod.json，内容使用上面的 JSON 结构
+aws secretsmanager create-secret \
+  --name kiro/monthly-report/feishu-bot-prod \
+  --description "Production Feishu bot for Kiro monthly reports" \
+  --secret-string file:///tmp/feishu-prod.json \
+  --region us-east-1
+rm -f /tmp/feishu-prod.json
+```
+
+禁止把 Webhook、签名密钥或 SecretString 写入 `config.yaml`、README、Git、CI 输出或普通日志。部署和验收只使用 ARN/`describe-secret`，不要调用会打印值的 `get-secret-value`。发送异常只返回异常类型，避免 URL 出现在日志或响应中。
+
+### 配置、通道和主动开关
+
+`config.example.yaml` 默认关闭通知；复制为 Git 忽略的 `config.yaml` 后再按环境填写。启用通知时，所选通道的 ARN 必填：
+
+```yaml
+monthly_report:
+  feishu_dev_secret_arn: "开发 Secret ARN"
+  feishu_prod_secret_arn: "生产 Secret ARN"
+  final_notification_enabled: true
+  final_notification_channel: "prod"  # dev / prod / both
+```
+
+| 通道 | 行为 |
+|------|------|
+| `dev` | 只读取开发 Secret；未配置时返回业务错误，不尝试生产通道 |
+| `prod` | 只读取生产 Secret；未配置/无权限/发送失败时绝不回退开发通道 |
+| `both` | 固定先 dev 后 prod，顺序发送、非事务、无回滚，可出现部分成功 |
+
+`both` 下如果两个 ARN 都配置且相同，运行时会对两个通道返回 `Feishu notification configuration error`，且一个 Webhook 也不会调用。如果前一个通道成功、后一个通道未配置或失败，前一个通知不会撤回。单通道模式不会比较 dev/prod ARN，因此部署前必须人工确认两个 ARN 不同；`deploy.sh` 会校验所选通道 ARN 非空，但当前不会比较 ARN 是否相同。
+
+直接使用 CloudFormation 模板时，其参数默认仍是 Final `true/dev`；不要依赖默认值。推荐始终通过 `deploy.sh` 显式传入本地配置，并在完整部署前对比 AWS 当前参数，防止生产通道被旧的本地配置覆盖。
+
+### Lambda 事件契约
+
+| 字段 | 必填 | 规则 |
+|------|------|------|
+| `month` | 否 | 严格 `YYYY-MM`；提供后直接选择该月，`report_type` 默认 `final` |
+| `time` | 计划任务应提供 | 未提供 `month` 时，使用事件时间所在月份减一；两者都没有才使用 Lambda 当前 UTC |
+| `report_type` | 否 | 仅 `provisional` / `final` |
+| `notify` | 否 | 默认 `false`；规范调用使用 JSON boolean。代码还兼容 `0/1`、`yes/no`、`on/off` 字符串 |
+| `notification_channel` | `notify=true` 时有效 | `dev` / `prod` / `both`，省略时默认 `dev` |
+| `backfill` | 否 | 回填脚本附带的审计元数据；handler 不读取，不改变行为 |
+
+规范事件示例：
+
+```json
+{"month":"2026-08","report_type":"final","notify":false}
+{"month":"2026-08","report_type":"final","notify":true,"notification_channel":"dev"}
+{"time":"2026-09-02T06:00:00Z","report_type":"final","notify":true,"notification_channel":"prod"}
+```
+
+`report_type=provisional` 本身不会强制静默；如果手动显式传入 `notify=true`，函数仍会尝试通知。生产 Provisional 静默由 EventBridge 输入中的 `notify=false` 保证。
+
+### Lambda 响应与成功判定
+
+handler 返回：`month`、`report_type`、`status`、`users`、`report_url`、`notification_attempted`、`notification_channels`、`notification_results`、`notification_error`、`warning`。
+
+```json
+{
+  "month": "2026-08",
+  "report_type": "final",
+  "status": "COMPLETE",
+  "users": 32,
+  "report_url": "https://example.invalid/report.xlsx",
+  "notification_attempted": true,
+  "notification_channels": ["prod"],
+  "notification_results": {"prod": null},
+  "notification_error": null,
+  "warning": ""
+}
+```
+
+- 报告生成成功：AWS Invoke 没有 `FunctionError`，响应包含 `report_url`，且对应 S3 对象存在。
+- 通知成功：`notification_attempted=true`、目标通道在 `notification_channels` 中、`notification_results.<channel> == null`，并且 `notification_error == null`。
+- `notification_attempted` 只表示事件请求发送，不代表飞书已成功接受。
+- 通知失败通常被捕获为 `notification_results` 字符串和聚合后的 `notification_error`，Lambda 仍正常返回，**不会产生 `FunctionError`**，也通常不会触发 EventBridge/Lambda 失败重试。
+- 报告文件先于通知写入；飞书失败不会回滚 S3 文件。
+- `warning` 可能说明 2026-02 部分数据、当前月部分快照或历史订阅名册不可重建。
+
+### 手动执行与历史回填
+
+手动执行默认不通知。测试开发机器人必须显式打开通知；生产和双通道必须明确指定：
+
+```bash
+aws lambda invoke --function-name kiro-monthly-credits-report \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"month":"2026-08","report_type":"final","notify":true,"notification_channel":"dev"}' \
+  /tmp/monthly-result.json
+cat /tmp/monthly-result.json
+```
+
+同步回填脚本默认从 2026-02 到最后一个已关闭自然月，逐月调用：
+
+```bash
+python3 scripts/backfill_monthly_reports.py
+python3 scripts/backfill_monthly_reports.py --start 2026-02 --end 2026-07
+python3 scripts/backfill_monthly_reports.py --include-current-partial
+python3 scripts/backfill_monthly_reports.py --start 2026-07 --end 2026-07 --notify --notification-channel dev
+python3 scripts/backfill_monthly_reports.py --start 2026-07 --end 2026-07 --notify --notification-channel prod
+```
+
+脚本会在 AWS Invoke 顶层 `FunctionError` 时停止，但当前不会解析响应体中的 `notification_error`。启用通知的回填必须逐月检查打印出的 `notification_results`/`notification_error`，不能只看进程退出码。部署不会自动回填；可通过 `--profile`/`--region` 指定 boto3 会话。
+
+### 部署、切换、轮换与回滚
+
+1. 运维人员先独立创建 dev/prod Secret；CloudFormation 不创建 Secret。
+2. 将两个 ARN 和明确的通知开关/通道写入本地 `config.yaml`；确认 dev/prod ARN 不同。
+3. 运行完整 `./deploy.sh`，或先创建 CloudFormation no-execute change set。Secret ARN 变化必须同时更新 IAM policy 和 Lambda environment，不能只手工改 Lambda 环境变量。
+4. 审查变更只涉及预期月报资源后再执行，并完成下方只读验收。
+5. 观察至少一个调度周期后，再考虑退役旧 Secret；删除 Secret 时使用恢复窗口，不立即永久删除。
+
+同 ARN 轮换可直接更新 Secret 版本并移动 `AWSCURRENT`。若 ARN 改变，必须重新部署 stack。版本回滚是恢复旧版本为 `AWSCURRENT`；ARN 回滚是把旧 ARN 写回配置并重新部署，以同步 IAM 和环境变量。
+
+快速止损：将 `final_notification_enabled` 改为 `false` 后部署。切回开发：保持 enabled 为 `true`，将 channel 改为 `dev` 后部署。两种回滚都不需要删除生产 Secret。
+
+### 部署后只读验收（不发送消息）
+
+以下命令不会读取 SecretString，也不会触发通知：
+
+```bash
+REGION=us-east-1
+aws cloudformation describe-stacks --stack-name kiro-analytics-stack --region "$REGION" \
+  --query 'Stacks[0].{Status:StackStatus,Params:Parameters[?starts_with(ParameterKey, `MonthlyFinalNotification`)]}'
+aws events describe-rule --name kiro-monthly-credits-final --region "$REGION"
+aws events list-targets-by-rule --rule kiro-monthly-credits-final --region "$REGION"
+aws events describe-rule --name kiro-monthly-credits-provisional --region "$REGION"
+aws events list-targets-by-rule --rule kiro-monthly-credits-provisional --region "$REGION"
+aws lambda get-function-configuration --function-name kiro-monthly-credits-report --region "$REGION" \
+  --query '{State:State,Update:LastUpdateStatus,Dev:Environment.Variables.FEISHU_DEV_SECRET_ARN,Prod:Environment.Variables.FEISHU_PROD_SECRET_ARN}'
+aws secretsmanager describe-secret --secret-id kiro/monthly-report/feishu-bot-dev --region "$REGION"
+aws secretsmanager describe-secret --secret-id kiro/monthly-report/feishu-bot-prod --region "$REGION"
+```
+
+期望：stack `UPDATE_COMPLETE`；Final `ENABLED` 且 InputTemplate 与预期 channel 一致；Provisional `ENABLED` 且 `notify=false`；Lambda `Active/Successful`；两个 Secret 元数据存在。生产端到端投递和客户端渲染只有在明确发送验证消息后才能认定为已验证。
+
+### 故障排查
+
+| 现象 | 检查位置 | 行为/处理 |
+|------|----------|-----------|
+| `FunctionError` | Lambda invoke 元数据、CloudWatch | 报告执行失败；检查 Athena、S3、IIC、超时和堆栈，修复后重跑 |
+| Secret 未配置 | `notification_results` | 返回 channel not configured；不回退其他通道，S3 报告通常已生成 |
+| Secrets Manager `AccessDenied` | IAM policy、Lambda env、`notification_error` | 确认 ARN 同时存在于 IAM 与环境变量；ARN 变化后重新部署 stack |
+| dev/prod ARN 相同且 channel=`both` | `notification_results` | 两边均 configuration error，零次 Webhook 调用；改为两个不同 ARN |
+| 飞书 HTTP/API 拒绝或网络失败 | `notification_results`、CloudWatch | 只返回异常类型以防泄密；报告不回滚，确认机器人配置后按需重发 |
+| `both` 部分成功 | 每个 channel 的 result | 非事务；成功的一边不会撤回，只重试失败通道时应改成单通道 |
+| Card 超限/旧客户端异常 | 飞书响应、实际客户端 | S3 报告仍可用；核对人数/文本长度和 7.20+ 客户端，必要时只发报告链接 |
+| 有报告但群里无消息 | S3、响应 JSON、EventBridge target | 不要只看 `FunctionError`；核对 `notification_attempted/results/error` 和实际 channel |
+
+### 本地测试与验证边界
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+python3 -m unittest tests.test_monthly_report -v
+python3 -m py_compile lambda/monthly_report/index.py tests/test_monthly_report.py \
+  scripts/backfill_monthly_reports.py scripts/sync_user_mapping.py
+bash -n deploy.sh
+cfn-lint infrastructure/cloudformation.yaml
+git diff --check
+```
+
+当前回归套件覆盖月份选择、套餐优先级、Excel/OOXML、负数环比、历史身份、Card 2.0 布局/预算、dev/prod/both 路由、缺失 Secret 不回退、同 ARN 的 `both` 拒绝和 CloudFormation 参数契约。它不覆盖真实 AWS 部署状态、生产 Webhook 投递、飞书客户端渲染，也不保证未来任意人数/文本长度都低于 payload 字节限制；这些必须通过部署后只读验收和受控的人工端到端验证补充。
 
 ## License
 
