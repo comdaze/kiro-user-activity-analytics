@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Documentation
+- 补充月报生产基线、事件/响应契约、业务通知错误判定和部署后只读验收
+- 补充 Feishu dev/prod Secret 创建、切换、轮换、回滚、`both` 部分成功与同 ARN 防护说明
+- 补充 Card JSON 2.0 客户端/容量边界、故障排查、测试边界和 Git 本地配置与 AWS 已部署真值的区别
+- 将 `config.example.yaml` 的 Final 通知改为安全默认关闭，避免空 Secret 配置在首次部署时触发失败
+
+## [1.4.0] - 2026-08-31
+
+### Added
+- **自然月 Kiro Credits 月报**：新增独立月报 Lambda，按订阅用户汇总 Credits、套餐容量、使用率、固定成本及连续低使用月份
+- **月度与年度 Excel**：生成月度明细、订阅快照、稳定别名和年度汇总工作簿，支持从 2026-02 开始同步回填
+- **双阶段调度**：每月 1 日生成静默暂定版，每月 2 日生成最终版；最终通知由显式开关和通道参数控制
+- **Feishu Card JSON 2.0**：响应式 KPI、风险折叠面板、浅色/深色企业配色、语义图标和完整报告按钮
+- **开发/生产通知隔离**：独立 Secrets Manager Secret，支持 `dev`、`prod`、`both` 显式通道；事件缺少 `notify` 时默认不通知，定时 Final 由 CloudFormation 参数明确启用，且生产通道不回退开发机器人
+- **历史身份回退**：从历史月报、用户映射和当前名册按身份字段合并姓名与邮箱，不使用当前名册补造历史订阅状态
+- **自动化回归测试**：覆盖月度边界、套餐优先级、Excel OOXML、身份合并、Card 2.0、容量限制和通知防误发逻辑
+
+### Changed
+- 用户映射同步保留已删除 Identity Center 用户最后一次有效姓名
+- 月报 Lambda 使用 SHA-256 地址化的不可变 S3 ZIP 制品部署，依赖固定为 `openpyxl==3.1.5` 和 `et-xmlfile==2.0.0`
+- Final EventBridge 规则显式传递 `notify` 与 `notification_channel`，Provisional 显式关闭通知
+
+### Fixed
+- 移除年度工作簿重复的 worksheet AutoFilter，避免 Excel 修复或删除筛选/视图记录
+- 修复重复用户 ID 覆盖有效姓名、跨风险组重名标识、低使用排序及首次低使用建议等边界问题
+- 风险用户超过 24 人时使用密集两行布局并保留全部用户；当前回归规模满足 Card 2.0 的 200 组件预算
+- 修复 detail CSV 中合法负数环比被公式注入防护误转义、导致年度工作簿显示为 0 的问题
+
 ## [1.3.0] - 2026-03-23
 
 ### Added
@@ -52,7 +80,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 - **用户名映射问题**：修复 Dashboard 中部分用户显示为 null 的问题
-  - AWS 在 2026-03-10 改变了 `user_report` 表的 userid 格式，从纯 UUID 变为带 Identity Store ID 前缀（如 `d-90661af5ec.{uuid}`）
+  - AWS 在 2026-03-10 改变了 `user_report` 表的 userid 格式，从纯 UUID 变为带 Identity Store ID 前缀（如 `d-xxxxxxxxxx.{uuid}`）
   - 原有的 `user_mapping` 表只包含纯 UUID，导致新格式无法 JOIN 匹配
   - 修复后为每个用户生成两种格式的映射记录（纯 UUID + 带前缀），确保新旧格式都能正确匹配
   - 影响文件：

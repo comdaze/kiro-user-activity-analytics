@@ -25,3 +25,29 @@ quicksight:
     # 获取方式: aws quicksight list-users --aws-account-id YOUR_ACCOUNT_ID --namespace default
   data_source_name: "KiroUserActivity"
   dataset_name: "KiroUserActivityDataset"
+  dashboard_id: "kiro-comprehensive-dashboard"
+
+# Dashboard 报告配置
+report:
+  email: "your-email@example.com"        # 报告接收邮箱（需通过 SES 验证）
+  schedule: "cron(0 5 * * ? *)"          # 每天 UTC 05:00 (北京 13:00)，在 SPICE 刷新后
+  bucket: "your-report-bucket"           # 报告输出桶（建议与数据桶分开，避免公开策略影响原始数据）
+
+
+# 月度 Credits Excel 报告（独立于每日 QuickSight/PDF）
+monthly_report:
+  # 未配置或精确 key 不存在时，从此 Kiro Application ARN 解析 IIC 分配
+  kiro_application_arn: "arn:aws:sso::YOUR_ACCOUNT_ID:application/ssoins-xxxxxxxxxxxxxxxx/apl-xxxxxxxxxxxxxxxx"
+  # 可选：数据桶中的精确 CSV key；有效空 CSV 也视为权威快照，不回退 IIC
+  subscription_csv_key: ""
+  # 可选：开发/生产 Feishu Secrets Manager ARN；Secret 由运维创建，CloudFormation 不创建
+  # Secret JSON: {"webhook":"https://...","sign_secret":"..."}；不要把 SecretString 写入配置/Git
+  feishu_dev_secret_arn: ""
+  feishu_prod_secret_arn: ""
+  # 安全默认关闭。启用时所选通道 ARN 必填；通道支持 dev / prod / both
+  # 生产示例：final_notification_enabled: true + final_notification_channel: "prod"
+  final_notification_enabled: false
+  final_notification_channel: "dev"
+  output_prefix: "dashboard-reports/public/kiro-monthly"
+  provisional_schedule: "cron(0 6 1 * ? *)"  # 每月 1 日 UTC 06:00，不通知
+  final_schedule: "cron(0 6 2 * ? *)"        # 每月 2 日 UTC 06:00；是否通知由上方开关控制

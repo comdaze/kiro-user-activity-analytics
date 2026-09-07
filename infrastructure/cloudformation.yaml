@@ -5,10 +5,6 @@ Parameters:
   S3BucketName:
     Type: String
     Description: S3 bucket containing Kiro user activity reports
-  S3Prefix:
-    Type: String
-    Default: 'amazon-q-developer/'
-    Description: S3 prefix for reports
   GlueDatabaseName:
     Type: String
     Default: 'kiro_analytics'
@@ -16,6 +12,70 @@ Parameters:
   IdentityStoreId:
     Type: String
     Description: IAM Identity Center Identity Store ID (e.g. d-xxxxxxxxxx)
+  DashboardId:
+    Type: String
+    Default: 'kiro-comprehensive-dashboard'
+    Description: QuickSight Dashboard ID for snapshot reports
+  ReportEmail:
+    Type: String
+    Description: Email address for dashboard report delivery
+  ReportSchedule:
+    Type: String
+    Default: 'cron(0 5 * * ? *)'
+    Description: EventBridge schedule for report generation (default daily UTC 05:00 / Beijing 13:00)
+  ReportBucket:
+    Type: String
+    Description: S3 bucket for dashboard report output (can differ from data bucket)
+  MonthlyArtifactBucket:
+    Type: String
+    Description: S3 bucket containing the immutable monthly Lambda ZIP
+  MonthlyArtifactKey:
+    Type: String
+    Description: S3 key of the immutable monthly Lambda ZIP
+  KiroApplicationArn:
+    Type: String
+    Default: ''
+    Description: Exact IAM Identity Center Kiro application ARN used for assignment resolution
+  SubscriptionCsvKey:
+    Type: String
+    Default: ''
+    Description: Optional exact S3 key in S3BucketName for the authoritative subscription roster CSV
+  FeishuDevSecretArn:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Optional development Feishu Secrets Manager ARN containing webhook/url and optional sign_secret
+  FeishuProdSecretArn:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Optional production Feishu Secrets Manager ARN containing webhook/url and optional sign_secret
+  MonthlyOutputPrefix:
+    Type: String
+    Default: dashboard-reports/public/kiro-monthly
+    Description: Public S3 prefix for monthly credits reports
+  MonthlyProvisionalSchedule:
+    Type: String
+    Default: 'cron(0 6 1 * ? *)'
+    Description: Provisional monthly report schedule (UTC 06:00 on day 1)
+  MonthlyFinalSchedule:
+    Type: String
+    Default: 'cron(0 6 2 * ? *)'
+    Description: Final monthly report schedule (UTC 06:00 on day 2)
+  MonthlyFinalNotificationEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Explicit switch controlling whether the final schedule sends a Feishu notification
+  MonthlyFinalNotificationChannel:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod, both]
+    Description: Explicit Feishu channel used by the final schedule
+
+Conditions:
+  HasFeishuDevSecret: !Not [!Equals [!Ref FeishuDevSecretArn, '']]
+  HasFeishuProdSecret: !Not [!Equals [!Ref FeishuProdSecretArn, '']]
 
 Resources:
   # Glue Database
@@ -141,6 +201,7 @@ Resources:
           ATHENA_WORKGROUP: kiro-analytics-workgroup
       Code:
         ZipFile: |
+          # NOTE: 此代码与 scripts/sync_user_mapping.py 逻辑一致，修改时请同步更新
           import boto3, csv, io, time, os
 
           BUCKET = os.environ['S3_BUCKET']
@@ -178,6 +239,23 @@ Resources:
                   name = u.get('DisplayName','') or u.get('UserName','') or uid
                   return name.replace('\r', '').replace('\n', '').strip()
               except: return uid
+
+          def canonical_uid(value):
+              value = (value or '').strip()
+              return value.split('.', 1)[1] if value.startswith('d-') and '.' in value else value
+
+          def load_previous_names():
+              try:
+                  body = s3.get_object(Bucket=BUCKET, Key=MAPPING_KEY)['Body'].read().decode('utf-8-sig')
+              except Exception:
+                  return {}
+              result = {}
+              for row in csv.DictReader(io.StringIO(body)):
+                  uid = canonical_uid(row.get('userid'))
+                  name = (row.get('username') or '').replace('\r', '').replace('\n', '').strip()
+                  if uid and name and name != uid:
+                      result[uid] = name
+              return result
 
           def ensure_table():
               ti = {
@@ -218,6 +296,7 @@ Resources:
               # 从 IIC 获取全部用户
               mapping = []
               iic_ids = set()
+              previous_names = load_previous_names()
               paginator_token = None
               while True:
                   kwargs = {'IdentityStoreId': ID_STORE}
@@ -227,6 +306,8 @@ Resources:
                       uid = u['UserId']
                       name = u.get('DisplayName','') or u.get('UserName','') or uid
                       name = name.replace('\r','').replace('\n','').strip()
+                      if name == uid:
+                          name = previous_names.get(uid, uid)
                       iic_ids.add(uid)
                       mapping.append((uid, name))
                       mapping.append((f'{ID_STORE}.{uid}', name))
@@ -236,8 +317,11 @@ Resources:
               for raw in sorted(raw_ids):
                   clean = raw.strip('"').strip()
                   if clean and clean not in iic_ids:
-                      mapping.append((clean, get_name(clean)))
-                      mapping.append((f'{ID_STORE}.{clean}', get_name(clean)))
+                      name = get_name(clean)
+                      if name == clean:
+                          name = previous_names.get(clean, clean)
+                      mapping.append((clean, name))
+                      mapping.append((f'{ID_STORE}.{clean}', name))
               buf = io.StringIO(newline='')
               w = csv.writer(buf, lineterminator='\n')
               w.writerow(['userid','username'])
@@ -267,6 +351,375 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt UserMappingScheduleRule.Arn
 
+  # ============================================
+  # Dashboard Snapshot Report Lambda
+  # ============================================
+  DashboardReportLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DashboardReportPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - quicksight:StartDashboardSnapshotJob
+                  - quicksight:DescribeDashboardSnapshotJob
+                  - quicksight:DescribeDashboardSnapshotJobResult
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ReportBucket}/dashboard-reports/*'
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                Resource: '*'
+
+  DashboardReportFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: kiro-dashboard-report
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DashboardReportLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 128
+      Environment:
+        Variables:
+          ACCOUNT_ID: !Ref AWS::AccountId
+          DASHBOARD_ID: !Ref DashboardId
+          S3_BUCKET: !Ref ReportBucket
+          REPORT_EMAIL: !Ref ReportEmail
+          AWS_REGION_NAME: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import boto3, time, os
+          from datetime import datetime, timezone, timedelta
+
+          def handler(event, context):
+              region = os.environ.get('AWS_REGION_NAME', 'us-east-1')
+              qs = boto3.client('quicksight', region_name=region)
+              s3 = boto3.client('s3', region_name=region)
+              ses = boto3.client('sesv2', region_name=region)
+
+              acct = os.environ['ACCOUNT_ID']
+              dash = os.environ['DASHBOARD_ID']
+              bucket = os.environ['S3_BUCKET']
+              email = os.environ['REPORT_EMAIL']
+              base_url = 'http://{}.s3-website-{}.amazonaws.com/dashboard-reports/public'.format(bucket, region)
+              sheets = [
+                  ('sheet-overview', '概览'),
+                  ('sheet-behavior', '用户行为'),
+                  ('sheet-cost', '成本分析'),
+                  ('sheet-user-summary', '用户概况'),
+              ]
+
+              bj = datetime.now(timezone(timedelta(hours=8)))
+              ts = bj.strftime('%Y%m%d%H%M')
+              date_str = bj.strftime('%Y-%m-%d')
+
+              jobs = []
+              for sid, name in sheets:
+                  jid = 'daily-{}-{}'.format(ts, sid)
+                  qs.start_dashboard_snapshot_job(
+                      AwsAccountId=acct, DashboardId=dash, SnapshotJobId=jid,
+                      UserConfiguration={'AnonymousUsers': [{}]},
+                      SnapshotConfiguration={
+                          'FileGroups': [{'Files': [{'SheetSelections': [{'SheetId': sid, 'SelectionScope': 'ALL_VISUALS'}], 'FormatType': 'PDF'}]}],
+                          'DestinationConfiguration': {'S3Destinations': [{'BucketConfiguration': {'BucketName': bucket, 'BucketPrefix': 'dashboard-reports/staging', 'BucketRegion': region}}]}
+                      })
+                  jobs.append((jid, name, sid))
+
+              time.sleep(90)
+
+              pdf_files = []
+              for jid, name, sid in jobs:
+                  try:
+                      r = qs.describe_dashboard_snapshot_job_result(AwsAccountId=acct, DashboardId=dash, SnapshotJobId=jid)
+                      uri = r['Result']['AnonymousUsers'][0]['FileGroups'][0]['S3Results'][0]['S3Uri']
+                      src_key = uri.replace('s3://{}/'.format(bucket), '')
+                      dst_key = 'dashboard-reports/public/{}/{}.pdf'.format(date_str, sid)
+                      s3.copy_object(Bucket=bucket, CopySource={'Bucket': bucket, 'Key': src_key}, Key=dst_key, ContentType='application/pdf', MetadataDirective='REPLACE', ContentDisposition='inline')
+                      s3.delete_object(Bucket=bucket, Key=src_key)
+                      pdf_files.append((name, sid, '{}/{}/{}.pdf'.format(base_url, date_str, sid)))
+                  except Exception as e:
+                      pdf_files.append((name, sid, 'ERROR: {}'.format(e)))
+
+              # Build HTML with PDF.js viewer
+              tabs = ''
+              viewers = ''
+              for i, (name, sid, url) in enumerate(pdf_files):
+                  if not url.startswith('http'):
+                      tabs += '<button class="tab" disabled>{} x</button>\n'.format(name)
+                      continue
+                  active = ' active' if i == 0 else ''
+                  hidden = '' if i == 0 else ' hidden'
+                  tabs += '<button class="tab{}" onclick="showTab(\'{}\')">{}</button>\n'.format(active, sid, name)
+                  viewers += '<div id="{sid}" class="viewer"{hidden}><canvas id="canvas-{sid}"></canvas><div class="nav"><button onclick="prevPage(\'{sid}\')">prev</button><span id="pageinfo-{sid}"></span><button onclick="nextPage(\'{sid}\')">next</button></div></div>\n'.format(sid=sid, hidden=hidden)
+
+              pdf_map = ','.join(["'{}':'{}'".format(sid, url) for name, sid, url in pdf_files if url.startswith('http')])
+              first_sid = sheets[0][0]
+
+              html = '''<!DOCTYPE html>
+          <html><head><meta charset="utf-8"><title>Kiro Dashboard - {date}</title>
+          <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+          <style>
+          *{{box-sizing:border-box;margin:0;padding:0}}body{{font-family:-apple-system,Arial,sans-serif;background:#f0f2f5}}
+          .header{{background:#232f3e;color:white;padding:20px 30px}}.header h1{{font-size:22px}}.header .meta{{color:#aaa;font-size:13px;margin-top:4px}}
+          .tabs{{display:flex;background:#37475a;padding:0 30px}}.tab{{padding:12px 24px;border:none;background:transparent;color:#ccc;font-size:14px;cursor:pointer;border-bottom:3px solid transparent}}
+          .tab:hover{{color:white}}.tab.active{{color:white;border-bottom-color:#ff9900;font-weight:bold}}
+          .content{{max-width:1200px;margin:20px auto;padding:0 20px}}.viewer{{background:white;border-radius:8px;padding:20px;box-shadow:0 1px 3px rgba(0,0,0,0.1)}}
+          .viewer canvas{{display:block;margin:0 auto;max-width:100%}}.nav{{display:flex;justify-content:center;align-items:center;gap:20px;margin-top:15px;padding-top:15px;border-top:1px solid #eee}}
+          .nav button{{padding:8px 16px;border:1px solid #ddd;border-radius:4px;background:white;cursor:pointer}}.nav button:hover{{background:#f5f5f5}}[hidden]{{display:none!important}}
+          </style></head><body>
+          <div class="header"><h1>Kiro Dashboard</h1><div class="meta">{date}</div></div>
+          <div class="tabs">{tabs}</div><div class="content">{viewers}</div>
+          <script>
+          var pdfs={{{pdfmap}}},state={{}};
+          pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+          function loadPdf(id){{if(state[id])return;pdfjsLib.getDocument(pdfs[id]).promise.then(function(d){{state[id]={{doc:d,page:1,total:d.numPages}};renderPage(id)}})}}
+          function renderPage(id){{var s=state[id];s.doc.getPage(s.page).then(function(p){{var v=p.getViewport({{scale:1.5}}),c=document.getElementById('canvas-'+id);c.width=v.width;c.height=v.height;p.render({{canvasContext:c.getContext('2d'),viewport:v}});document.getElementById('pageinfo-'+id).textContent=s.page+'/'+s.total}})}}
+          function prevPage(id){{if(state[id]&&state[id].page>1){{state[id].page--;renderPage(id)}}}}
+          function nextPage(id){{if(state[id]&&state[id].page<state[id].total){{state[id].page++;renderPage(id)}}}}
+          function showTab(id){{document.querySelectorAll('.tab').forEach(function(t){{t.classList.remove('active')}});event.target.classList.add('active');document.querySelectorAll('.viewer').forEach(function(v){{v.hidden=(v.id!==id)}});loadPdf(id)}}
+          loadPdf('{first}');
+          </script></body></html>'''.format(date=date_str, tabs=tabs, viewers=viewers, pdfmap=pdf_map, first=first_sid)
+
+              s3.put_object(Bucket=bucket, Key='dashboard-reports/public/{}/index.html'.format(date_str), Body=html.encode(), ContentType='text/html; charset=utf-8')
+              latest = '<html><head><meta http-equiv="refresh" content="0;url={}/{}/index.html"></head></html>'.format(base_url, date_str)
+              s3.put_object(Bucket=bucket, Key='dashboard-reports/public/index.html', Body=latest.encode(), ContentType='text/html; charset=utf-8')
+
+              report_url = '{}/{}/index.html'.format(base_url, date_str)
+              ses.send_email(
+                  FromEmailAddress=email, Destination={'ToAddresses': [email]},
+                  Content={'Simple': {
+                      'Subject': {'Data': '[Kiro Dashboard] Report - {}'.format(date_str)},
+                      'Body': {'Html': {'Data': '<h2>Kiro Dashboard</h2><p>{}</p><p><a href="{}">View Report</a></p>'.format(date_str, report_url)},
+                               'Text': {'Data': report_url}}
+                  }})
+              return {'statusCode': 200, 'body': report_url}
+
+  DashboardReportScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: kiro-dashboard-report-daily
+      Description: Daily dashboard snapshot report (after SPICE refresh)
+      ScheduleExpression: !Ref ReportSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DashboardReportFunction.Arn
+          Id: DashboardReportTarget
+
+  DashboardReportLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DashboardReportFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DashboardReportScheduleRule.Arn
+
+  # S3 Bucket Policy for public dashboard report access
+  DashboardReportBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReportBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadDashboardReports
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${ReportBucket}/dashboard-reports/public/*'
+
+  # ============================================
+  # Monthly Kiro credits Excel reports (additive)
+  # ============================================
+  MonthlyReportLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MonthlyReportPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                  - athena:GetWorkGroup
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${ReportBucket}'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+                  - !Sub 'arn:aws:s3:::${ReportBucket}/${MonthlyOutputPrefix}/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/athena-results/*'
+                  - !Sub 'arn:aws:s3:::${ReportBucket}/${MonthlyOutputPrefix}/*'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/user_report'
+              - Effect: Allow
+                Action: lakeformation:GetDataAccess
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sso:ListApplicationAssignments
+                  - sso:DescribeApplicationAssignment
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - identitystore:DescribeUser
+                  - identitystore:DescribeGroup
+                  - identitystore:ListGroupMemberships
+                Resource: '*'
+              - !If
+                - HasFeishuDevSecret
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref FeishuDevSecretArn
+                - !Ref AWS::NoValue
+              - !If
+                - HasFeishuProdSecret
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref FeishuProdSecretArn
+                - !Ref AWS::NoValue
+
+  MonthlyReportFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: kiro-monthly-credits-report
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt MonthlyReportLambdaRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      EphemeralStorage:
+        Size: 1024
+      ReservedConcurrentExecutions: 1
+      Code:
+        S3Bucket: !Ref MonthlyArtifactBucket
+        S3Key: !Ref MonthlyArtifactKey
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref S3BucketName
+          REPORT_BUCKET: !Ref ReportBucket
+          GLUE_DATABASE: !Ref GlueDatabaseName
+          ATHENA_WORKGROUP: !Ref AthenaWorkgroup
+          IDENTITY_STORE_ID: !Ref IdentityStoreId
+          KIRO_APPLICATION_ARN: !Ref KiroApplicationArn
+          SUBSCRIPTION_CSV_KEY: !Ref SubscriptionCsvKey
+          FEISHU_DEV_SECRET_ARN: !Ref FeishuDevSecretArn
+          FEISHU_PROD_SECRET_ARN: !Ref FeishuProdSecretArn
+          MONTHLY_OUTPUT_PREFIX: !Ref MonthlyOutputPrefix
+          AWS_REGION_NAME: !Ref AWS::Region
+
+  MonthlyReportLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${MonthlyReportFunction}'
+      RetentionInDays: 90
+
+  MonthlyProvisionalScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: kiro-monthly-credits-provisional
+      Description: Provisional prior-month credits report, no notification
+      ScheduleExpression: !Ref MonthlyProvisionalSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt MonthlyReportFunction.Arn
+          Id: MonthlyProvisionalTarget
+          InputTransformer:
+            InputPathsMap:
+              eventTime: $.time
+            InputTemplate: '{"time": <eventTime>, "report_type": "provisional", "notify": false}'
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 86400
+            MaximumRetryAttempts: 2
+
+  MonthlyFinalScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: kiro-monthly-credits-final
+      Description: Final prior-month credits report with best-effort Feishu notification
+      ScheduleExpression: !Ref MonthlyFinalSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt MonthlyReportFunction.Arn
+          Id: MonthlyFinalTarget
+          InputTransformer:
+            InputPathsMap:
+              eventTime: $.time
+            InputTemplate: !Sub '{"time": <eventTime>, "report_type": "final", "notify": ${MonthlyFinalNotificationEnabled}, "notification_channel": "${MonthlyFinalNotificationChannel}"}'
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 86400
+            MaximumRetryAttempts: 2
+
+  MonthlyProvisionalLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MonthlyReportFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonthlyProvisionalScheduleRule.Arn
+
+  MonthlyFinalLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MonthlyReportFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonthlyFinalScheduleRule.Arn
+
 Outputs:
   GlueDatabaseName:
     Value: !Ref GlueDatabase
@@ -282,3 +735,22 @@ Outputs:
     Value: !GetAtt UserMappingFunction.Arn
     Export:
       Name: KiroUserMappingFunction
+
+  DashboardReportFunctionArn:
+    Value: !GetAtt DashboardReportFunction.Arn
+    Export:
+      Name: KiroDashboardReportFunction
+
+  MonthlyReportFunctionArn:
+    Value: !GetAtt MonthlyReportFunction.Arn
+    Export:
+      Name: KiroMonthlyReportFunction
+
+  MonthlyReportRoleArn:
+    Value: !GetAtt MonthlyReportLambdaRole.Arn
+    Export:
+      Name: KiroMonthlyReportRole
+
+  DashboardReportUrl:
+    Value: !Sub 'http://${ReportBucket}.s3-website-${AWS::Region}.amazonaws.com/dashboard-reports/public/index.html'
+    Description: Public URL for the latest dashboard report

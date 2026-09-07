@@ -5,6 +5,15 @@ import json
 from pathlib import Path
 
 class QuickSightDeployer:
+    # QuickSight dataset permissions actions (shared across all datasets)
+    QS_DATASET_ACTIONS = [
+        'quicksight:DescribeDataSet', 'quicksight:DescribeDataSetPermissions',
+        'quicksight:PassDataSet', 'quicksight:DescribeIngestion',
+        'quicksight:ListIngestions', 'quicksight:UpdateDataSet',
+        'quicksight:DeleteDataSet', 'quicksight:CreateIngestion',
+        'quicksight:CancelIngestion', 'quicksight:UpdateDataSetPermissions'
+    ]
+
     def __init__(self, config_path='config.yaml'):
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
@@ -208,13 +217,7 @@ class QuickSightDeployer:
             ImportMode='SPICE',
             Permissions=[{
                 'Principal': self.config['quicksight']['user_arn'],
-                'Actions': [
-                    'quicksight:DescribeDataSet', 'quicksight:DescribeDataSetPermissions',
-                    'quicksight:PassDataSet', 'quicksight:DescribeIngestion',
-                    'quicksight:ListIngestions', 'quicksight:UpdateDataSet',
-                    'quicksight:DeleteDataSet', 'quicksight:CreateIngestion',
-                    'quicksight:CancelIngestion', 'quicksight:UpdateDataSetPermissions'
-                ]
+                'Actions': self.QS_DATASET_ACTIONS
             }]
         )
         try:
@@ -329,13 +332,7 @@ class QuickSightDeployer:
             ImportMode='SPICE',
             Permissions=[{
                 'Principal': self.config['quicksight']['user_arn'],
-                'Actions': [
-                    'quicksight:DescribeDataSet', 'quicksight:DescribeDataSetPermissions',
-                    'quicksight:PassDataSet', 'quicksight:DescribeIngestion',
-                    'quicksight:ListIngestions', 'quicksight:UpdateDataSet',
-                    'quicksight:DeleteDataSet', 'quicksight:CreateIngestion',
-                    'quicksight:CancelIngestion', 'quicksight:UpdateDataSetPermissions'
-                ]
+                'Actions': self.QS_DATASET_ACTIONS
             }]
         )
         try:
@@ -395,13 +392,7 @@ class QuickSightDeployer:
             ImportMode='SPICE',
             Permissions=[{
                 'Principal': self.config['quicksight']['user_arn'],
-                'Actions': [
-                    'quicksight:DescribeDataSet', 'quicksight:DescribeDataSetPermissions',
-                    'quicksight:PassDataSet', 'quicksight:DescribeIngestion',
-                    'quicksight:ListIngestions', 'quicksight:UpdateDataSet',
-                    'quicksight:DeleteDataSet', 'quicksight:CreateIngestion',
-                    'quicksight:CancelIngestion', 'quicksight:UpdateDataSetPermissions'
-                ]
+                'Actions': self.QS_DATASET_ACTIONS
             }]
         )
         try:
@@ -450,13 +441,7 @@ class QuickSightDeployer:
             ImportMode='SPICE',
             Permissions=[{
                 'Principal': self.config['quicksight']['user_arn'],
-                'Actions': [
-                    'quicksight:DescribeDataSet', 'quicksight:DescribeDataSetPermissions',
-                    'quicksight:PassDataSet', 'quicksight:DescribeIngestion',
-                    'quicksight:ListIngestions', 'quicksight:UpdateDataSet',
-                    'quicksight:DeleteDataSet', 'quicksight:CreateIngestion',
-                    'quicksight:CancelIngestion', 'quicksight:UpdateDataSetPermissions'
-                ]
+                'Actions': self.QS_DATASET_ACTIONS
             }]
         )
         try:
