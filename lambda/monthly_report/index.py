@@ -62,6 +62,11 @@ DETAIL_NUMERIC_FIELDS = {
     "unused_capacity_value", "active_days", "consecutive_low_months",
     "consecutive_zero_months", "previous_month_credits", "mom_change",
 }
+CHECKPOINT_AUDIT_FIELDS = [
+    "month", "checkpoint_day", "data_cutoff", "risk_type", "user_id", "user_name",
+    "subscription_tier", "subscription_tier_source", "credits", "capacity",
+    "current_usage_rate", "projected_month_end_rate", "estimated_plan_cost",
+]
 HEADERS = [
     "用户ID", "姓名", "邮箱", "部门", "订阅状态", "计划来源", "层级历史", "月末层级",
     "Credits", "容量", "使用率", "预计计划成本(USD)", "未用容量价值(USD)", "超额Credits",
@@ -408,8 +413,22 @@ def _tier_sql() -> str:
 def _tier_rank_sql(label: str = "tier_label") -> str:
     return f"CASE {label} WHEN 'Power' THEN 4 WHEN 'Pro Max' THEN 3 WHEN 'Pro+' THEN 2 WHEN 'Pro' THEN 1 ELSE 0 END"
 
-def build_usage_sql(database: str, month: str) -> str:
+def build_data_cutoff_sql(database: str, month: str) -> str:
     start, end = month_bounds(month)
+    return f"""
+SELECT CAST(MAX(TRY(date_parse(date, '%Y-%m-%d'))) AS VARCHAR) AS data_cutoff
+FROM "{database}"."user_report"
+WHERE TRY(date_parse(date, '%Y-%m-%d')) >= TIMESTAMP '{start.isoformat()} 00:00:00'
+  AND TRY(date_parse(date, '%Y-%m-%d')) < TIMESTAMP '{end.isoformat()} 00:00:00'
+""".strip()
+
+
+def build_usage_sql(database: str, month: str,
+                    data_cutoff: date | str | None = None) -> str:
+    start, end = month_bounds(month)
+    if data_cutoff is not None:
+        cutoff = data_cutoff if isinstance(data_cutoff, date) else date.fromisoformat(str(data_cutoff))
+        end = min(end, cutoff + timedelta(days=1))
     tier_sql, rank_sql = _tier_sql(), _tier_rank_sql()
     return f"""
 WITH typed AS (
@@ -443,14 +462,21 @@ GROUP BY d.user_id, h.tier_history ORDER BY d.user_id
 """.strip()
 
 
-def build_latest_tiers_sql(database: str) -> str:
+def build_latest_tiers_sql(database: str, data_cutoff: date | str | None = None) -> str:
     tier_sql, rank_sql = _tier_sql(), _tier_rank_sql()
+    cutoff_clause = ""
+    if data_cutoff is not None:
+        cutoff = data_cutoff if isinstance(data_cutoff, date) else date.fromisoformat(str(data_cutoff))
+        cutoff_clause = (
+            f"\n WHERE TRY(date_parse(date, '%Y-%m-%d')) < "
+            f"TIMESTAMP '{(cutoff + timedelta(days=1)).isoformat()} 00:00:00'"
+        )
     return f"""
 WITH typed AS (
  SELECT CASE WHEN strpos(userid, '.') > 0 THEN split_part(userid, '.', 2) ELSE userid END AS user_id,
         TRY(date_parse(date, '%Y-%m-%d')) AS usage_date,
         {tier_sql} AS tier_label
- FROM \"{database}\".\"user_report\"
+ FROM \"{database}\".\"user_report\"{cutoff_clause}
 ), ranked AS (
  SELECT *, {rank_sql} AS tier_rank
  FROM typed WHERE user_id IS NOT NULL AND user_id <> '' AND usage_date IS NOT NULL
@@ -828,6 +854,390 @@ def _identity_label(row: dict[str, Any], duplicate_names: set[str]) -> str:
     return name
 
 
+def validate_checkpoint_cutoff(month: str, data_cutoff: date | datetime | str) -> date:
+    """Return an ISO cutoff date that belongs to the target natural month."""
+    try:
+        if isinstance(data_cutoff, datetime):
+            cutoff = data_cutoff.date()
+        elif isinstance(data_cutoff, date):
+            cutoff = data_cutoff
+        else:
+            cutoff = date.fromisoformat(sanitize(data_cutoff))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("data_cutoff must be a valid ISO date") from exc
+    start, end = month_bounds(month)
+    if not start <= cutoff < end:
+        raise ValueError("data_cutoff must belong to the target month")
+    return cutoff
+
+
+def projected_month_end_rate(month: str, usage_rate: Any,
+                             data_cutoff: date | datetime | str) -> Decimal:
+    """Project cumulative utilization using the actual latest data day."""
+    cutoff = validate_checkpoint_cutoff(month, data_cutoff)
+    days_in_month = monthrange(cutoff.year, cutoff.month)[1]
+    return decimal(usage_rate) * Decimal(days_in_month) / Decimal(cutoff.day)
+
+
+def unicode_progress_bar(percent: Any, width: int = 10) -> str:
+    """Render a compact fixed-width Unicode progress bar."""
+    if width <= 0:
+        raise ValueError("progress bar width must be positive")
+    value = max(Decimal(0), min(Decimal(100), decimal(percent)))
+    filled = int((value * Decimal(width) / Decimal(100)).quantize(
+        Decimal("1"), rounding=ROUND_HALF_UP,
+    ))
+    return "█" * filled + "░" * (width - filled)
+
+
+def apply_checkpoint_subscription_snapshot(
+        rows: list[dict[str, Any]], roster: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Overlay an authoritative current subscription snapshot on checkpoint-only rows."""
+    normalized_roster = {}
+    for raw_uid, subscription in roster.items():
+        uid = canonical_user_id(raw_uid or subscription.get("userid") or subscription.get("user_id"))
+        if uid:
+            normalized_roster[uid] = subscription
+    result = []
+    for row in rows:
+        effective = dict(row)
+        uid = canonical_user_id(row.get("user_id"))
+        subscription = normalized_roster.get(uid, {})
+        name = sanitize(subscription.get("user_name") or subscription.get("username"))
+        email = sanitize(subscription.get("email"))
+        if name and name != uid:
+            effective["user_name"] = name
+        if email:
+            effective["email"] = email
+        effective["checkpoint_subscription_tier_authoritative"] = False
+        effective["checkpoint_subscription_tier_source"] = "latest_at_data_cutoff"
+        tier = normalize_tier(subscription.get("subscription_tier"))
+        if tier != "Unknown":
+            meta = TIERS[tier]
+            credits = decimal(row.get("credits"))
+            capacity = Decimal(meta["capacity"])
+            rate = credits / capacity if capacity else Decimal(0)
+            color, pressure = usage_band(credits, capacity)
+            effective.update({
+                "month_end_tier": tier,
+                "capacity": int(capacity),
+                "usage_rate": rate,
+                "color": color,
+                "capacity_pressure": pressure,
+                "estimated_plan_cost": meta["price"],
+                "unused_capacity_value": (
+                    Decimal(meta["price"]) * max(Decimal(0), Decimal(1) - rate)
+                    if capacity else Decimal(0)
+                ),
+                "plan_source": sanitize(subscription.get("plan_source") or "current subscription snapshot"),
+                "checkpoint_subscription_tier_authoritative": True,
+                "checkpoint_subscription_tier_source": "current_authoritative_snapshot",
+            })
+        result.append(effective)
+    return result
+
+
+def apply_checkpoint_iic_group_tiers(
+        rows: list[dict[str, Any]], roster: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Prefer current IIC group tiers; direct assignments retain cutoff-bounded usage tiers."""
+    group_roster = {
+        canonical_user_id(uid): subscription
+        for uid, subscription in roster.items()
+        if sanitize(subscription.get("plan_source")) == "IIC group"
+    }
+    effective_rows = apply_checkpoint_subscription_snapshot(rows, group_roster)
+    for row in effective_rows:
+        if row.get("checkpoint_subscription_tier_authoritative"):
+            row["checkpoint_subscription_tier_source"] = "current_iic_group"
+    return effective_rows
+
+
+def select_checkpoint_risks(month: str, rows: list[dict[str, Any]], checkpoint_day: int,
+                            data_cutoff: date | datetime | str) -> dict[str, Any]:
+    """Select disjoint day-10/day-20 risk groups from cumulative month-to-date rows."""
+    if checkpoint_day not in {10, 20}:
+        raise ValueError("checkpoint_day must be 10 or 20")
+    cutoff = validate_checkpoint_cutoff(month, data_cutoff)
+    days_in_month = monthrange(cutoff.year, cutoff.month)[1]
+    zero_rows = [row for row in rows if decimal(row.get("credits")) == 0]
+    projected_low_rows: list[dict[str, Any]] = []
+    if checkpoint_day == 20:
+        for row in rows:
+            if decimal(row.get("credits")) <= 0 or decimal(row.get("capacity")) <= 0:
+                continue
+            projected_rate = projected_month_end_rate(month, row.get("usage_rate"), cutoff)
+            if projected_rate < Decimal("0.10"):
+                projected_row = dict(row)
+                projected_row["projected_usage_rate"] = projected_rate
+                projected_low_rows.append(projected_row)
+    risk_rows = zero_rows + projected_low_rows
+    return {
+        "month": month,
+        "checkpoint_day": checkpoint_day,
+        "data_cutoff": cutoff,
+        "days_in_month": days_in_month,
+        "total_users": len(rows),
+        "zero_rows": zero_rows,
+        "projected_low_rows": projected_low_rows,
+        "risk_count": len(risk_rows),
+        "risk_cost": sum(
+            (decimal(row.get("estimated_plan_cost")) for row in risk_rows), Decimal(0)
+        ),
+    }
+
+
+def build_feishu_checkpoint_card(
+        month: str, rows: list[dict[str, Any]], checkpoint_day: int,
+        data_cutoff: date | datetime | str, preview: bool = False,
+        subscription_roster: dict[str, dict[str, Any]] | None = None) -> dict[str, Any] | None:
+    """Build a concise Card JSON 2.0 checkpoint brief, or None when delivery is silent."""
+    effective_rows = (
+        apply_checkpoint_subscription_snapshot(rows, subscription_roster)
+        if subscription_roster is not None else rows
+    )
+    snapshot = select_checkpoint_risks(month, effective_rows, checkpoint_day, data_cutoff)
+    zero_rows = list(snapshot["zero_rows"])
+    low_rows = list(snapshot["projected_low_rows"])
+    if not snapshot["risk_count"]:
+        return None
+
+    name_counts: dict[str, int] = defaultdict(int)
+    for row in effective_rows:
+        name = sanitize(row.get("user_name"))
+        uid = canonical_user_id(row.get("user_id"))
+        if name and name != uid:
+            name_counts[name.casefold()] += 1
+    duplicate_names = {name for name, count in name_counts.items() if count > 1}
+
+    def label(row: dict[str, Any]) -> str:
+        return _identity_label(row, duplicate_names)
+
+    zero_rows.sort(key=lambda row: (
+        -decimal(row.get("estimated_plan_cost")),
+        label(row).casefold(), canonical_user_id(row.get("user_id")),
+    ))
+    low_rows.sort(key=lambda row: (
+        decimal(row.get("projected_usage_rate")),
+        -decimal(row.get("estimated_plan_cost")),
+        label(row).casefold(), canonical_user_id(row.get("user_id")),
+    ))
+
+    def metric_column(title: str, value: str, detail: str = "",
+                      weight: int = 1) -> dict[str, Any]:
+        content = "\n".join([title, f"**{value}**"] + ([detail] if detail else []))
+        return {
+            "tag": "column", "width": "weighted", "weight": weight,
+            "background_style": "neutral_bg", "padding": "8px 6px 8px 6px",
+            "vertical_align": "center",
+            "elements": [{
+                "tag": "markdown", "text_align": "center", "text_size": "normal",
+                "content": content,
+            }],
+        }
+
+    def metric_row(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "tag": "column_set", "flex_mode": "bisect", "horizontal_spacing": "8px",
+            "horizontal_align": "left", "columns": [left, right],
+        }
+
+    def metric_full(column: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "tag": "column_set", "flex_mode": "stretch",
+            "horizontal_align": "left", "columns": [column],
+        }
+
+    def zero_list() -> str:
+        return "\n".join(
+            f"**{_md_escape(label(row))}** · {_md_escape(row.get('month_end_tier') or 'Unknown')}"
+            f" · **${decimal(row.get('estimated_plan_cost')):.2f}**"
+            for row in zero_rows
+        )
+
+    def low_list() -> str:
+        items = []
+        for row in low_rows:
+            items.append(
+                f"**{_md_escape(label(row))}** · {_md_escape(row.get('month_end_tier') or 'Unknown')}"
+                f" · **${decimal(row.get('estimated_plan_cost')):.2f}**\n"
+                f"{_format_credits(row.get('credits'))} / {int(decimal(row.get('capacity'))):,} Credits"
+                f" · 当前 {_format_usage_rate(row.get('usage_rate'))}"
+                f" · 预计月末 **{_format_usage_rate(row.get('projected_usage_rate'))}**"
+            )
+        return "\n\n".join(items)
+
+    def risk_panel(element_id: str, title: str, content: str) -> dict[str, Any]:
+        return {
+            "tag": "collapsible_panel", "element_id": element_id, "expanded": False,
+            "background_color": "panel_bg", "vertical_spacing": "4px",
+            "padding": "8px 8px 8px 8px", "margin": "2px 0px 0px 0px",
+            "header": {
+                "title": {"tag": "markdown", "content": title},
+                "background_color": "neutral_bg", "padding": "8px 8px 8px 8px",
+                "icon": {
+                    "tag": "standard_icon", "token": "down-small-ccm_outlined",
+                    "color": "grey", "size": "16px 16px",
+                },
+                "icon_position": "right", "icon_expanded_angle": -180,
+            },
+            "border": {"color": "border_soft", "corner_radius": "6px"},
+            "elements": [{"tag": "markdown", "content": content, "text_size": "normal"}],
+        }
+
+    progress_value = 30 if checkpoint_day == 10 else 60
+    progress_text = f"{progress_value}%"
+    title = (
+        "Kiro 用量简报 · 每月10日启动提醒" if checkpoint_day == 10
+        else "Kiro 用量简报 · 每月20日风险提醒"
+    )
+    zero_title = "尚未使用" if checkpoint_day == 10 else "零使用用户"
+    elements: list[dict[str, Any]] = [
+        metric_row(
+            metric_column("月度进度", progress_text, unicode_progress_bar(progress_value)),
+            metric_column(
+                zero_title, f"{len(zero_rows)} 人",
+                f"占订阅用户 {format_percent(len(zero_rows), snapshot['total_users'])}",
+            ),
+        ),
+    ]
+    cost_metric = metric_column(
+        "风险订阅成本", f"${snapshot['risk_cost']:.2f}",
+        f"涉及 {snapshot['risk_count']} 人",
+    )
+    if checkpoint_day == 10:
+        elements.append(metric_full(cost_metric))
+        summary = (
+            f"本月进度已达 **30%**，仍有 **{len(zero_rows)} 位**订阅用户尚未使用 Kiro，"
+            f"涉及订阅成本 **${snapshot['risk_cost']:.2f}**。建议尽快确认使用计划，避免整月闲置。"
+        )
+    else:
+        elements.append(metric_row(
+            metric_column("预测低利用率", f"{len(low_rows)} 人", "预计月末 <10%"),
+            cost_metric,
+        ))
+        summary = (
+            f"本月进度已达 **60%**，仍有 **{len(zero_rows)} 位**用户零使用、"
+            f"**{len(low_rows)} 位**用户预计月末利用率低于 10%。建议在续费前确认订阅保留必要性。"
+        )
+    elements.append({
+        "tag": "column_set", "flex_mode": "stretch", "background_style": "advice_bg",
+        "columns": [{
+            "tag": "column", "width": "weighted", "weight": 1,
+            "padding": "9px 10px 9px 10px",
+            "elements": [{"tag": "markdown", "content": f"💡 **提醒摘要**\n{summary}"}],
+        }],
+    })
+    if zero_rows:
+        panel_title = (
+            f"**尚未使用名单 · {len(zero_rows)}人**　成本 ${sum((decimal(row.get('estimated_plan_cost')) for row in zero_rows), Decimal(0)):.2f}"
+        )
+        elements.append(risk_panel("checkpoint_zero_users", panel_title, zero_list()))
+    if low_rows:
+        low_cost = sum((decimal(row.get("estimated_plan_cost")) for row in low_rows), Decimal(0))
+        elements.append(risk_panel(
+            "checkpoint_projected_low_users",
+            f"**预计月末低于 10% · {len(low_rows)}人**　成本 ${low_cost:.2f}",
+            low_list(),
+        ))
+    cutoff = snapshot["data_cutoff"].isoformat()
+    note = "累计口径；Kiro 数据可能延迟 1–2 天。"
+    risk_rows = zero_rows + low_rows
+    authoritative_tiers = sum(
+        bool(row.get("checkpoint_subscription_tier_authoritative")) for row in risk_rows
+    )
+    if authoritative_tiers == len(risk_rows):
+        note += " 订阅套餐以当前权威快照为准。"
+    elif authoritative_tiers:
+        note += " 订阅套餐部分来自当前权威快照，其余以该数据截止日最新记录为准。"
+    else:
+        note += " 订阅套餐以该数据截止日的最新可用记录为准。"
+    if checkpoint_day == 20:
+        note += " 预计月末利用率按当前累计使用率 ÷ 截止日号 × 当月天数计算。"
+    elements.append({
+        "tag": "markdown", "text_size": "notation", "text_align": "center",
+        "content": f"数据截至 **{cutoff}** · {note}",
+    })
+
+    header_tags = []
+    if preview:
+        header_tags.append({
+            "tag": "text_tag", "element_id": "preview_tag", "color": "grey",
+            "text": {"tag": "plain_text", "content": "效果预览"},
+        })
+    if checkpoint_day == 10:
+        header_tags.append({
+            "tag": "text_tag", "element_id": "startup_tag", "color": "yellow",
+            "text": {"tag": "plain_text", "content": "启动提醒"},
+        })
+    else:
+        if zero_rows:
+            header_tags.append({
+                "tag": "text_tag", "element_id": "checkpoint_zero_tag", "color": "red",
+                "text": {"tag": "plain_text", "content": f"零使用 {len(zero_rows)}"},
+            })
+        if low_rows:
+            header_tags.append({
+                "tag": "text_tag", "element_id": "checkpoint_low_tag", "color": "orange",
+                "text": {"tag": "plain_text", "content": f"预测低用 {len(low_rows)}"},
+            })
+
+    return {
+        "msg_type": "interactive",
+        "card": {
+            "schema": "2.0",
+            "config": {
+                "enable_forward": True, "update_multi": True, "width_mode": "fill",
+                "style": {"color": {
+                    "neutral_bg": {
+                        "light_mode": "rgba(245,246,247,0.92)",
+                        "dark_mode": "rgba(41,41,41,0.82)",
+                    },
+                    "panel_bg": {
+                        "light_mode": "rgba(250,251,252,0.98)",
+                        "dark_mode": "rgba(26,26,26,0.94)",
+                    },
+                    "border_soft": {
+                        "light_mode": "rgba(31,35,41,0.10)",
+                        "dark_mode": "rgba(255,255,255,0.12)",
+                    },
+                    "advice_bg": {
+                        "light_mode": (
+                            "rgba(143,105,22,0.10)" if checkpoint_day == 10
+                            else "rgba(245,63,63,0.10)"
+                        ),
+                        "dark_mode": (
+                            "rgba(221,173,72,0.14)" if checkpoint_day == 10
+                            else "rgba(255,92,92,0.14)"
+                        ),
+                    },
+                }},
+                "summary": {"content": (
+                    f"{month} Kiro10日简报：零使用{len(zero_rows)}人，"
+                    f"风险成本${snapshot['risk_cost']:.2f}"
+                    if checkpoint_day == 10 else
+                    f"{month} Kiro20日简报：零使用{len(zero_rows)}人，"
+                    f"预测低用{len(low_rows)}人，风险成本${snapshot['risk_cost']:.2f}"
+                )},
+            },
+            "header": {
+                "template": "yellow" if checkpoint_day == 10 else "red",
+                "padding": "12px 12px 12px 12px",
+                "title": {"tag": "plain_text", "content": title},
+                "subtitle": {
+                    "tag": "plain_text",
+                    "content": f"{month} 自然月 · 累计口径 · 数据截至 {cutoff}",
+                },
+                "text_tag_list": header_tags,
+            },
+            "body": {
+                "direction": "vertical", "padding": "12px 12px 12px 12px",
+                "vertical_spacing": "10px", "horizontal_align": "left",
+                "elements": elements,
+            },
+        },
+    }
+
+
 def build_feishu_card(month: str, rows: list[dict[str, Any]], url: str,
                       status: str = "COMPLETE", warning: str = "") -> dict[str, Any]:
     """Build a Card JSON 2.0 report with responsive KPI columns and risk panels."""
@@ -1177,14 +1587,237 @@ def send_feishu_channels(secrets: Any, secret_arns: dict[str, str], channels: li
     return results
 
 
+def select_checkpoint_context(event: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+    raw_day = event.get("checkpoint_day")
+    if raw_day not in {10, 20, "10", "20"}:
+        raise ValueError("checkpoint_day must be 10 or 20")
+    checkpoint_day = int(raw_day)
+    raw_time = event.get("time")
+    if raw_time:
+        event_time = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
+    else:
+        event_time = now or datetime.now(timezone.utc)
+    if event_time.tzinfo is None:
+        event_time = event_time.replace(tzinfo=timezone.utc)
+    month = sanitize(event.get("month"))
+    if month:
+        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
+            raise ValueError("month must be YYYY-MM")
+    else:
+        shanghai_time = event_time.astimezone(timezone(timedelta(hours=8)))
+        month = f"{shanghai_time.year:04d}-{shanghai_time.month:02d}"
+    return {
+        "month": month,
+        "checkpoint_day": checkpoint_day,
+        "event_time": event_time.isoformat(),
+        "notify": _event_bool(event.get("notify"), False),
+    }
+
+
+def checkpoint_audit_keys(prefix: str, month: str, checkpoint_day: int) -> dict[str, str]:
+    base = f"{prefix.rstrip('/')}/{month[:4]}/{month[5:7]}"
+    stem = f"kiro-checkpoint-{month}-day-{checkpoint_day:02d}"
+    return {"json": f"{base}/{stem}.json", "csv": f"{base}/{stem}.csv"}
+
+
+def checkpoint_notification_marker_key(
+        prefix: str, month: str, checkpoint_day: int, channel: str) -> str:
+    base = f"{prefix.rstrip('/')}/{month[:4]}/{month[5:7]}"
+    return f"{base}/kiro-checkpoint-{month}-day-{checkpoint_day:02d}-notification-{channel}.json"
+
+
+def checkpoint_audit_records(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    records = []
+    groups = (("zero", snapshot["zero_rows"]), ("projected_low", snapshot["projected_low_rows"]))
+    for risk_type, rows in groups:
+        for row in rows:
+            records.append({
+                "month": snapshot["month"],
+                "checkpoint_day": snapshot["checkpoint_day"],
+                "data_cutoff": snapshot["data_cutoff"].isoformat(),
+                "risk_type": risk_type,
+                "user_id": canonical_user_id(row.get("user_id")),
+                "user_name": sanitize(row.get("user_name")),
+                "subscription_tier": normalize_tier(row.get("month_end_tier")),
+                "subscription_tier_source": sanitize(
+                    row.get("checkpoint_subscription_tier_source") or "latest_at_data_cutoff"
+                ),
+                "credits": str(decimal(row.get("credits"))),
+                "capacity": str(int(decimal(row.get("capacity")))),
+                "current_usage_rate": str(decimal(row.get("usage_rate"))),
+                "projected_month_end_rate": (
+                    str(decimal(row.get("projected_usage_rate"))) if risk_type == "projected_low" else ""
+                ),
+                "estimated_plan_cost": str(decimal(row.get("estimated_plan_cost"))),
+            })
+    return records
+
+
+def checkpoint_audit_csv(records: list[dict[str, Any]]) -> bytes:
+    out = io.StringIO(newline="")
+    writer = csv.DictWriter(out, fieldnames=CHECKPOINT_AUDIT_FIELDS, lineterminator="\n")
+    writer.writeheader()
+    for row in records:
+        writer.writerow({field: sanitize(row.get(field)) for field in CHECKPOINT_AUDIT_FIELDS})
+    return out.getvalue().encode("utf-8-sig")
+
+
+def _checkpoint_audit_body(summary: dict[str, Any], records: list[dict[str, Any]]) -> bytes:
+    payload = dict(summary)
+    payload["risks"] = records
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+
+
+def handle_checkpoint(event: dict[str, Any], clients: dict[str, Any], config: dict[str, str]) -> dict[str, Any]:
+    selection = select_checkpoint_context(event)
+    month, checkpoint_day = selection["month"], selection["checkpoint_day"]
+    cutoff_rows = run_athena_query(
+        clients["athena"], build_data_cutoff_sql(config["database"], month), config["workgroup"],
+    )
+    cutoff_value = sanitize(cutoff_rows[0].get("data_cutoff"))[:10] if cutoff_rows else ""
+    if not cutoff_value:
+        raise RuntimeError(f"No user_report data is available for checkpoint month {month}")
+    data_cutoff = validate_checkpoint_cutoff(month, cutoff_value)
+    usage = usage_rows_by_id(run_athena_query(
+        clients["athena"], build_usage_sql(config["database"], month, data_cutoff), config["workgroup"],
+    ))
+    roster, authoritative = load_csv_roster(
+        clients["s3"], config["data_bucket"], config["subscription_csv_key"],
+    )
+    if not authoritative:
+        latest_rows = run_athena_query(
+            clients["athena"], build_latest_tiers_sql(config["database"], data_cutoff), config["workgroup"],
+        )
+        observed_tiers = {
+            canonical_user_id(row.get("user_id")): normalize_tier(row.get("latest_tier"))
+            for row in latest_rows if canonical_user_id(row.get("user_id"))
+        }
+        roster = resolve_application_roster(
+            clients["sso"], clients["identity"], config["application_arn"],
+            config["identity_store_id"], observed_tiers,
+        )
+    roster = roster or {}
+    identity_map = merge_identity_maps(
+        load_identity_mapping(clients["s3"], config["data_bucket"], config["identity_mapping_key"]),
+        identity_projection(roster),
+    )
+    rows = merge_report_rows(month, usage, roster, True, identity_map=identity_map)
+    roster_ids = {canonical_user_id(uid) for uid in roster}
+    rows = [row for row in rows if canonical_user_id(row.get("user_id")) in roster_ids]
+    effective_rows = (
+        apply_checkpoint_subscription_snapshot(rows, roster)
+        if authoritative else apply_checkpoint_iic_group_tiers(rows, roster)
+    )
+    snapshot = select_checkpoint_risks(month, effective_rows, checkpoint_day, data_cutoff)
+    records = checkpoint_audit_records(snapshot)
+    keys = checkpoint_audit_keys(config["checkpoint_output_prefix"], month, checkpoint_day)
+    status = "RISK" if snapshot["risk_count"] else "SILENT_NO_RISK"
+    summary = {
+        "month": month,
+        "checkpoint_day": checkpoint_day,
+        "event_time": selection["event_time"],
+        "data_cutoff": data_cutoff.isoformat(),
+        "status": status,
+        "users": len(effective_rows),
+        "zero_users": len(snapshot["zero_rows"]),
+        "projected_low_users": len(snapshot["projected_low_rows"]),
+        "risk_count": snapshot["risk_count"],
+        "risk_cost": str(snapshot["risk_cost"]),
+        "subscription_tier_source": (
+            "current_authoritative_snapshot" if authoritative else
+            "current_iic_group_or_latest_at_data_cutoff"
+        ),
+        "notification_requested": bool(selection["notify"]),
+        "notification_attempted": False,
+        "notification_channels": [],
+        "notification_results": {},
+        "notification_error": None,
+        "notification_skipped_channels": [],
+    }
+    _put(
+        clients["s3"], config["report_bucket"], keys["csv"], checkpoint_audit_csv(records),
+        "text/csv; charset=utf-8",
+    )
+    _put(
+        clients["s3"], config["report_bucket"], keys["json"],
+        _checkpoint_audit_body(summary, records), "application/json; charset=utf-8",
+    )
+    if snapshot["risk_count"] and selection["notify"]:
+        requested_channels = select_notification_channels(event)
+        claimed_channels = []
+        skipped_channels = []
+        for channel in requested_channels:
+            marker_key = checkpoint_notification_marker_key(
+                config["checkpoint_output_prefix"], month, checkpoint_day, channel,
+            )
+            marker = json.dumps({
+                "month": month,
+                "checkpoint_day": checkpoint_day,
+                "channel": channel,
+                "event_time": selection["event_time"],
+                "state": "attempt_claimed",
+            }, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            if _put_once(
+                    clients["s3"], config["report_bucket"], marker_key, marker,
+                    "application/json; charset=utf-8"):
+                claimed_channels.append(channel)
+            else:
+                skipped_channels.append(channel)
+        results = {}
+        if claimed_channels:
+            payload = build_feishu_checkpoint_card(
+                month, effective_rows, checkpoint_day, data_cutoff,
+            )
+            results = send_feishu_channels(
+                clients["secrets"],
+                {"dev": config["feishu_dev_secret_arn"], "prod": config["feishu_prod_secret_arn"]},
+                claimed_channels, payload,
+            )
+        errors = [f"{channel}: {error}" for channel, error in results.items() if error]
+        summary.update({
+            "notification_attempted": bool(claimed_channels),
+            "notification_channels": claimed_channels,
+            "notification_results": results,
+            "notification_error": "; ".join(errors) or None,
+            "notification_skipped_channels": skipped_channels,
+        })
+        try:
+            _put(
+                clients["s3"], config["report_bucket"], keys["json"],
+                _checkpoint_audit_body(summary, records), "application/json; charset=utf-8",
+            )
+        except Exception as exc:
+            summary["audit_update_error"] = f"Checkpoint audit update failed: {type(exc).__name__}"
+    return {
+        **summary,
+        "report_type": f"checkpoint_day{checkpoint_day}",
+        "audit_json_key": keys["json"],
+        "audit_csv_key": keys["csv"],
+    }
+
+
 def _put(s3: Any, bucket: str, key: str, body: bytes, content_type: str) -> None:
     s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType=content_type, ServerSideEncryption="AES256")
 
 
+def _put_once(s3: Any, bucket: str, key: str, body: bytes, content_type: str) -> bool:
+    try:
+        s3.put_object(
+            Bucket=bucket, Key=key, Body=body, ContentType=content_type,
+            ServerSideEncryption="AES256", IfNoneMatch="*",
+        )
+        return True
+    except Exception as exc:
+        response = getattr(exc, "response", {})
+        error = response.get("Error", {})
+        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if error.get("Code") in {"PreconditionFailed", "ConditionalRequestConflict", "412"} or status == 412:
+            return False
+        raise
+
+
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     event = event or {}
-    selection = select_report_month(event)
-    month, report_type = selection["month"], selection["report_type"]
     region = os.environ.get("AWS_REGION_NAME") or os.environ.get("AWS_REGION", "us-east-1")
     data_bucket = os.environ["DATA_BUCKET"]
     report_bucket = os.environ["REPORT_BUCKET"]
@@ -1197,6 +1830,24 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "sso": boto3.client("sso-admin", region_name=region), "identity": boto3.client("identitystore", region_name=region),
         "secrets": boto3.client("secretsmanager", region_name=region),
     }
+    if "checkpoint_day" in event:
+        return handle_checkpoint(event, clients, {
+            "data_bucket": data_bucket,
+            "report_bucket": report_bucket,
+            "database": database,
+            "workgroup": workgroup,
+            "identity_store_id": identity_store_id,
+            "application_arn": os.environ.get("KIRO_APPLICATION_ARN", ""),
+            "subscription_csv_key": os.environ.get("SUBSCRIPTION_CSV_KEY", ""),
+            "identity_mapping_key": os.environ.get("IDENTITY_MAPPING_KEY", IDENTITY_MAPPING_KEY),
+            "checkpoint_output_prefix": os.environ.get(
+                "CHECKPOINT_OUTPUT_PREFIX", "dashboard-reports/private/kiro-monthly-checkpoints",
+            ),
+            "feishu_dev_secret_arn": os.environ.get("FEISHU_DEV_SECRET_ARN", ""),
+            "feishu_prod_secret_arn": os.environ.get("FEISHU_PROD_SECRET_ARN", ""),
+        })
+    selection = select_report_month(event)
+    month, report_type = selection["month"], selection["report_type"]
     usage = usage_rows_by_id(run_athena_query(clients["athena"], build_usage_sql(database, month), workgroup))
     roster, authoritative = load_csv_roster(clients["s3"], data_bucket, os.environ.get("SUBSCRIPTION_CSV_KEY", ""))
     if not authoritative:

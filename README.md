@@ -499,15 +499,18 @@ AWS 提供两种订阅方式，根据账号所在区域和需求选择：
 
 月报由独立 Lambda `kiro-monthly-credits-report` 生成，不替换或修改每日 QuickSight/PDF 管道。运行时为 Python 3.12；`deploy.sh` 按 `lambda/monthly_report/requirements.txt` 构建 SHA-256 地址化的不可变 ZIP，并上传到数据桶的 `artifacts/monthly-report/<sha256>.zip`。月报函数预留并发为 1，超时 900 秒，日志保留 90 天。
 
-### 已部署生产基线（截至 2026-08-31）
+### 已部署生产基线（截至 2026-09-10）
 
 | 项目 | 已部署值 |
 |------|----------|
 | CloudFormation stack | `kiro-analytics-stack` / `UPDATE_COMPLETE` |
 | Provisional | `cron(0 6 1 * ? *)`、`ENABLED`、`notify=false` |
 | Final | `cron(0 6 2 * ? *)`、`ENABLED`、`notify=true`、`notification_channel=prod` |
+| Day 10 checkpoint | `cron(0 1 10 * ? *)`（北京时间09:00）、`ENABLED`、`notify=true`、`prod` |
+| Day 20 checkpoint | `cron(0 1 20 * ? *)`（北京时间09:00）、`ENABLED`、`notify=true`、`prod` |
+| Checkpoint 审计 | `dashboard-reports/private/kiro-monthly-checkpoints/` 下的 SSE-S3 JSON/CSV；不公开 |
 | Secret | `kiro/monthly-report/feishu-bot-dev` 与 `kiro/monthly-report/feishu-bot-prod` 独立存在 |
-| 生产验收范围 | Secret 元数据、Lambda 环境、IAM、EventBridge 输入均已只读验收；切换生产通道时未发送测试消息 |
+| 生产验收范围 | Stack/Lambda/IAM/EventBridge 已只读验收；`notify=false` 烟测验证 Athena、IIC 与私有审计写入；2026-09-10 09:00 Day 10 首次生产调度投递成功，prod 审计无错误且幂等 marker 已写入 |
 
 这张表是带日期的运维快照，不替代 AWS 实际状态。CloudFormation parameters、EventBridge target 和 Lambda environment 才是已部署真值；`config.example.yaml` 只是无环境模板，Git 忽略的 `config.yaml` 是下一次部署输入，不是可靠的生产审计记录。
 
@@ -515,7 +518,11 @@ AWS 提供两种订阅方式，根据账号所在区域和需求选择：
 
 - Provisional：每月 1 日 UTC 06:00（北京时间 14:00）生成上一个自然月，EventBridge 明确传入 `notify=false`。
 - Final：每月 2 日 UTC 06:00 生成上一个自然月；是否通知及通道完全由 CloudFormation 参数显式传入。
-- Athena 仅查询 `user_report`，按规范化用户 ID 汇总 Credits，日期使用 `[月初, 下月月初)` 半开区间和 `TRY` 类型转换。
+- Day 10：每月 10 日 UTC 01:00 检查当前自然月，仅在存在零使用订阅用户时通知。
+- Day 20：每月 20 日 UTC 01:00 检查当前自然月；通知零使用用户，以及按实际数据截止日投影后预计月末利用率 `<10%` 的非零用户。
+- Checkpoint 使用 Athena `MAX(date)` 作为实际截止日，并把用量及直接 USER 的套餐回退查询锁定在同一截止日；无风险时静默但仍写私有审计，不生成 Excel/年度文件。
+- Checkpoint 按月/日/通道先以 S3 `IfNoneMatch=*` 原子认领再发送，避免 EventBridge 至少一次投递导致重复群消息。该策略是 at-most-once attempt：认领后的网络失败不会自动重发，需要根据审计人工处理。
+- Athena 仅查询 `user_report`，按规范化用户 ID 汇总 Credits，日期使用半开区间和 `TRY` 类型转换。
 - 2026-02 标记为 `PARTIAL`，可用数据从 2026-02-10 开始。
 - 历史回填早于“当前上一个自然月”时，不使用当前订阅名册补造历史零使用用户；工作簿会明确提示历史名册无法重建。
 
@@ -528,6 +535,8 @@ dashboard-reports/public/kiro-monthly/YYYY/MM/kiro-credits-YYYY-MM.xlsx  # Final
 dashboard-reports/public/kiro-monthly/YYYY/MM/kiro-credits-YYYY-MM-detail.csv
 dashboard-reports/public/kiro-monthly/YYYY/MM/kiro-credits-YYYY-MM-subscriptions.csv  # 仅可安全使用当前名册时生成
 dashboard-reports/public/kiro-monthly/YYYY/kiro-credits-YYYY.xlsx
+dashboard-reports/private/kiro-monthly-checkpoints/YYYY/MM/kiro-checkpoint-YYYY-MM-day-10.{json,csv}
+dashboard-reports/private/kiro-monthly-checkpoints/YYYY/MM/kiro-checkpoint-YYYY-MM-day-20.{json,csv}
 ```
 
 月度持久化文件先写入 S3，再重建年度文件，最后才尝试通知。年度工作簿每次从该年度全部 detail CSV 重建，不增量追加；数值字段保留合法负数，文本字段进行公式注入防护。所有新对象使用 SSE-S3。
@@ -544,12 +553,20 @@ dashboard-reports/public/kiro-monthly/YYYY/kiro-credits-YYYY.xlsx
 
 ### Feishu Card JSON 2.0
 
+#### Final 完整月报卡片
+
 - 固定企业蓝 Header，KPI/面板使用浅色和深色独立的中性色 token；红/橙仅作为小型风险标签。
-- 语义图标限定为用户、成本、零使用、低用、建议和完整报告，不使用装饰性 Emoji 堆叠。
 - 零使用面板始终展开；总风险 `<=20` 时低用面板展开，`>=21` 时折叠，但用户仍保留在 JSON。
 - 风险人数 `<=24` 使用双列两行明细，`>24` 使用密集两行 Markdown，以降低组件数且不截断用户。
-- Card JSON 2.0 官方客户端要求为 7.20+；PC、iOS、Android 按钮均配置报告 URL。组织实际客户端仍需人工渲染验收。
-- 官方上限为 200 个组件。回归样例验证 32 位全风险用户仍低于 200 组件，常规生产样例低于项目自定 20KB 目标；当前实现没有运行时 payload 字节硬限制。若未来用户名或人数显著增长导致飞书拒绝，S3 报告仍然存在，错误只会体现在 Lambda 响应字段中。
+- PC、iOS、Android 按钮均配置完整 Excel 报告 URL。
+
+#### Day 10/20 Checkpoint 简报卡片
+
+- Day 10 使用土黄色 Header、`30%` Unicode 进度条，仅显示零使用风险；Day 20 使用红色 Header、`60%` 进度条，显示零使用和预计月末 `<10%` 风险。
+- 风险面板默认折叠但保留全部用户；初始视图不展示正常/高使用用户、分布、年度工作簿或完整报告按钮。
+- 实际数据截止日和套餐来源显示在卡片中；Day 20 投影使用 `当前累计使用率 ÷ 截止日号 × 当月天数`。
+
+两类卡片都使用 Card JSON 2.0，官方客户端要求为 7.20+，语义图标不堆叠装饰性 Emoji。官方上限为 200 个组件；回归样例验证 32 位风险用户低于 200 组件和项目自定 20KB 目标。当前实现没有运行时 payload 字节硬限制，若未来人数或姓名长度显著增长，S3 报告/审计仍保留，飞书错误体现在 Lambda 响应中。
 
 ### Secret 创建与安全边界
 
@@ -589,6 +606,13 @@ monthly_report:
   feishu_prod_secret_arn: "生产 Secret ARN"
   final_notification_enabled: true
   final_notification_channel: "prod"  # dev / prod / both
+  day10_notification_enabled: true
+  day10_notification_channel: "prod"
+  day20_notification_enabled: true
+  day20_notification_channel: "prod"
+  checkpoint_output_prefix: "dashboard-reports/private/kiro-monthly-checkpoints"
+  day10_schedule: "cron(0 1 10 * ? *)"
+  day20_schedule: "cron(0 1 20 * ? *)"
 ```
 
 | 通道 | 行为 |
@@ -611,6 +635,7 @@ monthly_report:
 | `notify` | 否 | 默认 `false`；规范调用使用 JSON boolean。代码还兼容 `0/1`、`yes/no`、`on/off` 字符串 |
 | `notification_channel` | `notify=true` 时有效 | `dev` / `prod` / `both`，省略时默认 `dev` |
 | `backfill` | 否 | 回填脚本附带的审计元数据；handler 不读取，不改变行为 |
+| `checkpoint_day` | Checkpoint 必填 | 仅 `10` / `20`；存在时进入当前月简报分支，不生成月度/年度 Excel |
 
 规范事件示例：
 
@@ -618,13 +643,17 @@ monthly_report:
 {"month":"2026-08","report_type":"final","notify":false}
 {"month":"2026-08","report_type":"final","notify":true,"notification_channel":"dev"}
 {"time":"2026-09-02T06:00:00Z","report_type":"final","notify":true,"notification_channel":"prod"}
+{"time":"2026-09-10T01:00:00Z","checkpoint_day":10,"notify":true,"notification_channel":"prod"}
+{"time":"2026-09-20T01:00:00Z","checkpoint_day":20,"notify":true,"notification_channel":"prod"}
 ```
 
 `report_type=provisional` 本身不会强制静默；如果手动显式传入 `notify=true`，函数仍会尝试通知。生产 Provisional 静默由 EventBridge 输入中的 `notify=false` 保证。
 
 ### Lambda 响应与成功判定
 
-handler 返回：`month`、`report_type`、`status`、`users`、`report_url`、`notification_attempted`、`notification_channels`、`notification_results`、`notification_error`、`warning`。
+#### Final / Provisional 月报
+
+月报分支返回：`month`、`report_type`、`status`、`users`、`report_url`、`notification_attempted`、`notification_channels`、`notification_results`、`notification_error`、`warning`。
 
 ```json
 {
@@ -643,10 +672,39 @@ handler 返回：`month`、`report_type`、`status`、`users`、`report_url`、`
 
 - 报告生成成功：AWS Invoke 没有 `FunctionError`，响应包含 `report_url`，且对应 S3 对象存在。
 - 通知成功：`notification_attempted=true`、目标通道在 `notification_channels` 中、`notification_results.<channel> == null`，并且 `notification_error == null`。
-- `notification_attempted` 只表示事件请求发送，不代表飞书已成功接受。
-- 通知失败通常被捕获为 `notification_results` 字符串和聚合后的 `notification_error`，Lambda 仍正常返回，**不会产生 `FunctionError`**，也通常不会触发 EventBridge/Lambda 失败重试。
-- 报告文件先于通知写入；飞书失败不会回滚 S3 文件。
-- `warning` 可能说明 2026-02 部分数据、当前月部分快照或历史订阅名册不可重建。
+- 报告文件先于通知写入；飞书失败不会回滚 S3 文件。`warning` 可能说明部分数据或历史名册限制。
+
+#### Day 10 / Day 20 Checkpoint
+
+Checkpoint 不返回 `report_url`，也不生成 Excel。响应增加 `checkpoint_day`、`data_cutoff`、`zero_users`、`projected_low_users`、`risk_count`、`risk_cost`、`audit_json_key`、`audit_csv_key`、`notification_requested` 和 `notification_skipped_channels`。
+
+```json
+{
+  "month": "2026-09",
+  "report_type": "checkpoint_day10",
+  "checkpoint_day": 10,
+  "data_cutoff": "2026-09-08",
+  "status": "RISK",
+  "users": 22,
+  "zero_users": 3,
+  "projected_low_users": 0,
+  "risk_count": 3,
+  "risk_cost": "80",
+  "notification_requested": true,
+  "notification_attempted": true,
+  "notification_channels": ["prod"],
+  "notification_results": {"prod": null},
+  "notification_error": null,
+  "notification_skipped_channels": [],
+  "audit_json_key": "dashboard-reports/private/kiro-monthly-checkpoints/2026/09/kiro-checkpoint-2026-09-day-10.json",
+  "audit_csv_key": "dashboard-reports/private/kiro-monthly-checkpoints/2026/09/kiro-checkpoint-2026-09-day-10.csv"
+}
+```
+
+- 执行成功：没有 `FunctionError`，JSON/CSV 私有审计对象存在且使用 SSE-S3；`SILENT_NO_RISK` 表示无风险静默，不应有通知 attempt。
+- 通知成功判定与月报相同；重复事件若已存在对应通道 marker，会出现在 `notification_skipped_channels`，不会重复发送。
+- `notification_attempted` 只表示本次取得 marker 后实际发起发送，不代表飞书最终送达；通知错误被捕获为业务字段，通常不会产生 `FunctionError`。
+- Marker 是 at-most-once attempt 控制：认领后网络失败不会自动重发，人工处理前必须先核对审计和实际群消息。
 
 ### 手动执行与历史回填
 
@@ -682,7 +740,7 @@ python3 scripts/backfill_monthly_reports.py --start 2026-07 --end 2026-07 --noti
 
 同 ARN 轮换可直接更新 Secret 版本并移动 `AWSCURRENT`。若 ARN 改变，必须重新部署 stack。版本回滚是恢复旧版本为 `AWSCURRENT`；ARN 回滚是把旧 ARN 写回配置并重新部署，以同步 IAM 和环境变量。
 
-快速止损：将 `final_notification_enabled` 改为 `false` 后部署。切回开发：保持 enabled 为 `true`，将 channel 改为 `dev` 后部署。两种回滚都不需要删除生产 Secret。
+快速止损：分别将 `final_notification_enabled`、`day10_notification_enabled`、`day20_notification_enabled` 改为 `false` 后部署；规则仍会运行并留下私有审计，但不会通知。切回开发时将对应 channel 改为 `dev`。若某月 marker 已认领但需要人工重发，应先核对实际投递结果，避免删除 marker 后造成重复消息。
 
 ### 部署后只读验收（不发送消息）
 

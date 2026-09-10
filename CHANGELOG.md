@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-09-10
+
+### Added
+- 每月10日启动提醒与20日风险提醒：使用当前月累计 Credits、实际数据截止日、Unicode 进度条和黄/红分级 Card JSON 2.0
+- 独立 Day 10/Day 20 EventBridge 调度、通知开关和 dev/prod/both 通道；无风险静默
+- 私有 SSE-S3 checkpoint JSON/CSV 审计，以及按月/日/通道的条件写入幂等 marker，防止重复群消息
+- 当前 IIC 套餐组优先、直接 USER 截止日内最新套餐回退和权威订阅 CSV 覆盖
+
+### Fixed
+- Checkpoint cutoff、用量和套餐回退查询统一到同一实际数据日，避免展示日期与风险计算漂移
+- 部署当前不可变 Lambda 制品，同时带入此前 Git 中的负数月环比 CSV/年度工作簿修复
+
 ### Documentation
 - 补充月报生产基线、事件/响应契约、业务通知错误判定和部署后只读验收
 - 补充 Feishu dev/prod Secret 创建、切换、轮换、回滚、`both` 部分成功与同 ARN 防护说明

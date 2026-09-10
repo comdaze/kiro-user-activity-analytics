@@ -48,9 +48,16 @@ MONTHLY_FEISHU_DEV_SECRET_ARN=$(python3 -c "import yaml; c=yaml.safe_load(open('
 MONTHLY_FEISHU_PROD_SECRET_ARN=$(python3 -c "import yaml; c=yaml.safe_load(open('config.yaml')); print(c.get('monthly_report',{}).get('feishu_prod_secret_arn',''))")
 MONTHLY_FINAL_NOTIFICATION_ENABLED=$(python3 -c "import yaml; c=yaml.safe_load(open('config.yaml')); print(str(c.get('monthly_report',{}).get('final_notification_enabled',True)).lower())")
 MONTHLY_FINAL_NOTIFICATION_CHANNEL=$(python3 -c "import yaml; c=yaml.safe_load(open('config.yaml')); print(c.get('monthly_report',{}).get('final_notification_channel','dev'))")
+MONTHLY_DAY10_NOTIFICATION_ENABLED=$(python3 -c "import yaml; c=yaml.safe_load(open('config.yaml')); print(str(c.get('monthly_report',{}).get('day10_notification_enabled',False)).lower())")
+MONTHLY_DAY10_NOTIFICATION_CHANNEL=$(python3 -c "import yaml; c=yaml.safe_load(open('config.yaml')); print(c.get('monthly_report',{}).get('day10_notification_channel','dev'))")
+MONTHLY_DAY20_NOTIFICATION_ENABLED=$(python3 -c "import yaml; c=yaml.safe_load(open('config.yaml')); print(str(c.get('monthly_report',{}).get('day20_notification_enabled',False)).lower())")
+MONTHLY_DAY20_NOTIFICATION_CHANNEL=$(python3 -c "import yaml; c=yaml.safe_load(open('config.yaml')); print(c.get('monthly_report',{}).get('day20_notification_channel','dev'))")
 MONTHLY_OUTPUT_PREFIX=$(python3 -c "import yaml; c=yaml.safe_load(open('config.yaml')); print(c.get('monthly_report',{}).get('output_prefix','dashboard-reports/public/kiro-monthly'))")
+MONTHLY_CHECKPOINT_OUTPUT_PREFIX=$(python3 -c "import yaml; c=yaml.safe_load(open('config.yaml')); print(c.get('monthly_report',{}).get('checkpoint_output_prefix','dashboard-reports/private/kiro-monthly-checkpoints'))")
 MONTHLY_PROVISIONAL_SCHEDULE=$(python3 -c "import yaml; c=yaml.safe_load(open('config.yaml')); print(c.get('monthly_report',{}).get('provisional_schedule','cron(0 6 1 * ? *)'))")
 MONTHLY_FINAL_SCHEDULE=$(python3 -c "import yaml; c=yaml.safe_load(open('config.yaml')); print(c.get('monthly_report',{}).get('final_schedule','cron(0 6 2 * ? *)'))")
+MONTHLY_DAY10_SCHEDULE=$(python3 -c "import yaml; c=yaml.safe_load(open('config.yaml')); print(c.get('monthly_report',{}).get('day10_schedule','cron(0 1 10 * ? *)'))")
+MONTHLY_DAY20_SCHEDULE=$(python3 -c "import yaml; c=yaml.safe_load(open('config.yaml')); print(c.get('monthly_report',{}).get('day20_schedule','cron(0 1 20 * ? *)'))")
 AWS_PROFILE=${AWS_PROFILE:-default}
 export AWS_PROFILE
 
@@ -59,20 +66,29 @@ if [ -z "$MONTHLY_SUBSCRIPTION_CSV_KEY" ] && [ -z "$MONTHLY_KIRO_APPLICATION_ARN
     echo "❌ monthly_report 必须配置 subscription_csv_key 或 kiro_application_arn"
     exit 1
 fi
-case "$MONTHLY_FINAL_NOTIFICATION_ENABLED" in true|false) ;; *)
-    echo "❌ final_notification_enabled 必须为 true 或 false"; exit 1 ;;
+case "$MONTHLY_CHECKPOINT_OUTPUT_PREFIX" in dashboard-reports/private/*) ;; *)
+    echo "❌ checkpoint_output_prefix 必须位于 dashboard-reports/private/ 下"; exit 1 ;;
 esac
-case "$MONTHLY_FINAL_NOTIFICATION_CHANNEL" in dev|prod|both) ;; *)
-    echo "❌ final_notification_channel 必须为 dev、prod 或 both"; exit 1 ;;
-esac
-if [ "$MONTHLY_FINAL_NOTIFICATION_ENABLED" = "true" ]; then
-    if { [ "$MONTHLY_FINAL_NOTIFICATION_CHANNEL" = "dev" ] || [ "$MONTHLY_FINAL_NOTIFICATION_CHANNEL" = "both" ]; } && [ -z "$MONTHLY_FEISHU_DEV_SECRET_ARN" ]; then
-        echo "❌ 已启用开发通道通知，但 feishu_dev_secret_arn 未配置"; exit 1
+validate_monthly_notification() {
+    local LABEL=$1 ENABLED=$2 CHANNEL=$3
+    case "$ENABLED" in true|false) ;; *)
+        echo "❌ ${LABEL}_notification_enabled 必须为 true 或 false"; exit 1 ;;
+    esac
+    case "$CHANNEL" in dev|prod|both) ;; *)
+        echo "❌ ${LABEL}_notification_channel 必须为 dev、prod 或 both"; exit 1 ;;
+    esac
+    if [ "$ENABLED" = "true" ]; then
+        if { [ "$CHANNEL" = "dev" ] || [ "$CHANNEL" = "both" ]; } && [ -z "$MONTHLY_FEISHU_DEV_SECRET_ARN" ]; then
+            echo "❌ ${LABEL} 已启用开发通道，但 feishu_dev_secret_arn 未配置"; exit 1
+        fi
+        if { [ "$CHANNEL" = "prod" ] || [ "$CHANNEL" = "both" ]; } && [ -z "$MONTHLY_FEISHU_PROD_SECRET_ARN" ]; then
+            echo "❌ ${LABEL} 已启用生产通道，但 feishu_prod_secret_arn 未配置（不会回退开发通道）"; exit 1
+        fi
     fi
-    if { [ "$MONTHLY_FINAL_NOTIFICATION_CHANNEL" = "prod" ] || [ "$MONTHLY_FINAL_NOTIFICATION_CHANNEL" = "both" ]; } && [ -z "$MONTHLY_FEISHU_PROD_SECRET_ARN" ]; then
-        echo "❌ 已启用生产通道通知，但 feishu_prod_secret_arn 未配置（不会回退开发通道）"; exit 1
-    fi
-fi
+}
+validate_monthly_notification final "$MONTHLY_FINAL_NOTIFICATION_ENABLED" "$MONTHLY_FINAL_NOTIFICATION_CHANNEL"
+validate_monthly_notification day10 "$MONTHLY_DAY10_NOTIFICATION_ENABLED" "$MONTHLY_DAY10_NOTIFICATION_CHANNEL"
+validate_monthly_notification day20 "$MONTHLY_DAY20_NOTIFICATION_ENABLED" "$MONTHLY_DAY20_NOTIFICATION_CHANNEL"
 echo "  Region:    $REGION"
 echo "  Account:   $ACCOUNT_ID"
 echo "  S3 Bucket: $BUCKET"
@@ -142,10 +158,17 @@ aws cloudformation deploy \
         FeishuDevSecretArn="$MONTHLY_FEISHU_DEV_SECRET_ARN" \
         FeishuProdSecretArn="$MONTHLY_FEISHU_PROD_SECRET_ARN" \
         MonthlyOutputPrefix="$MONTHLY_OUTPUT_PREFIX" \
+        CheckpointOutputPrefix="$MONTHLY_CHECKPOINT_OUTPUT_PREFIX" \
         MonthlyProvisionalSchedule="$MONTHLY_PROVISIONAL_SCHEDULE" \
         MonthlyFinalSchedule="$MONTHLY_FINAL_SCHEDULE" \
         MonthlyFinalNotificationEnabled="$MONTHLY_FINAL_NOTIFICATION_ENABLED" \
         MonthlyFinalNotificationChannel="$MONTHLY_FINAL_NOTIFICATION_CHANNEL" \
+        MonthlyDay10Schedule="$MONTHLY_DAY10_SCHEDULE" \
+        MonthlyDay20Schedule="$MONTHLY_DAY20_SCHEDULE" \
+        MonthlyDay10NotificationEnabled="$MONTHLY_DAY10_NOTIFICATION_ENABLED" \
+        MonthlyDay10NotificationChannel="$MONTHLY_DAY10_NOTIFICATION_CHANNEL" \
+        MonthlyDay20NotificationEnabled="$MONTHLY_DAY20_NOTIFICATION_ENABLED" \
+        MonthlyDay20NotificationChannel="$MONTHLY_DAY20_NOTIFICATION_CHANNEL" \
     --capabilities CAPABILITY_IAM \
     --region $REGION \
     --no-fail-on-empty-changeset
