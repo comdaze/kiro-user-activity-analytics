@@ -293,6 +293,479 @@ class MonthlyReportTests(unittest.TestCase):
     def find_card_element(self, card, element_id):
         return next(element for element in card["body"]["elements"] if element.get("element_id") == element_id)
 
+    def test_checkpoint_cutoff_projection_and_validation(self):
+        self.assertEqual(
+            Decimal("0.075"),
+            monthly.projected_month_end_rate("2026-09", Decimal("0.02"), "2026-09-08"),
+        )
+        self.assertEqual(
+            Decimal("0.10"),
+            monthly.projected_month_end_rate("2026-02", Decimal("0.05"), "2026-02-14"),
+        )
+        self.assertEqual(
+            Decimal("0.029"),
+            monthly.projected_month_end_rate("2024-02", Decimal("0.01"), "2024-02-10"),
+        )
+        self.assertEqual(
+            Decimal("0.031"),
+            monthly.projected_month_end_rate("2026-01", Decimal("0.01"), "2026-01-10"),
+        )
+        boundary_rows = [
+            {
+                "user_id": "exact", "credits": 50, "capacity": 1000,
+                "usage_rate": Decimal("0.05"), "estimated_plan_cost": 20,
+            },
+            {
+                "user_id": "below", "credits": Decimal("49.999"), "capacity": 1000,
+                "usage_rate": Decimal("0.049999"), "estimated_plan_cost": 20,
+            },
+        ]
+        boundary = monthly.select_checkpoint_risks(
+            "2026-02", boundary_rows, 20, "2026-02-14",
+        )
+        self.assertEqual(["below"], [row["user_id"] for row in boundary["projected_low_rows"]])
+        self.assertEqual(
+            "2026-09-08",
+            monthly.validate_checkpoint_cutoff("2026-09", "2026-09-08").isoformat(),
+        )
+        self.assertEqual(
+            "2026-09-01",
+            monthly.validate_checkpoint_cutoff("2026-09", "2026-09-01").isoformat(),
+        )
+        self.assertEqual(
+            "2026-09-30",
+            monthly.validate_checkpoint_cutoff("2026-09", "2026-09-30").isoformat(),
+        )
+        with self.assertRaisesRegex(ValueError, "target month"):
+            monthly.validate_checkpoint_cutoff("2026-09", "2026-08-31")
+        with self.assertRaisesRegex(ValueError, "target month"):
+            monthly.validate_checkpoint_cutoff("2026-09", "2026-10-01")
+        with self.assertRaisesRegex(ValueError, "valid ISO date"):
+            monthly.validate_checkpoint_cutoff("2026-09", "not-a-date")
+        with self.assertRaisesRegex(ValueError, "10 or 20"):
+            monthly.select_checkpoint_risks("2026-09", [], 15, "2026-09-08")
+        self.assertEqual("███░░░░░░░", monthly.unicode_progress_bar(30))
+        self.assertEqual("██████░░░░", monthly.unicode_progress_bar(60))
+        self.assertEqual("░░░░░░░░░░", monthly.unicode_progress_bar(-1))
+        self.assertEqual("██████████", monthly.unicode_progress_bar(101))
+        with self.assertRaisesRegex(ValueError, "width must be positive"):
+            monthly.unicode_progress_bar(30, 0)
+
+    def test_checkpoint_authoritative_subscription_snapshot_overrides_tier(self):
+        rows = [{
+            "user_id": "tier-user", "user_name": "套餐变更用户", "email": "old@example.com",
+            "month_end_tier": "Pro", "credits": 50, "capacity": 1000,
+            "usage_rate": Decimal("0.05"), "color": "red", "estimated_plan_cost": 20,
+            "unused_capacity_value": 19,
+        }]
+        self.assertIsNone(monthly.build_feishu_checkpoint_card(
+            "2026-09", rows, 20, "2026-09-08",
+        ))
+        roster = {"tier-user": {
+            "subscription_tier": "Pro+", "user_name": "当前套餐用户",
+            "email": "current@example.com", "plan_source": "authoritative CSV",
+        }}
+        effective = monthly.apply_checkpoint_subscription_snapshot(rows, roster)
+        self.assertEqual("Pro", rows[0]["month_end_tier"])
+        self.assertEqual(1000, rows[0]["capacity"])
+        self.assertEqual("Pro+", effective[0]["month_end_tier"])
+        self.assertEqual(2000, effective[0]["capacity"])
+        self.assertEqual(Decimal("0.025"), effective[0]["usage_rate"])
+        self.assertEqual(40, effective[0]["estimated_plan_cost"])
+        self.assertEqual("当前套餐用户", effective[0]["user_name"])
+        self.assertEqual("current@example.com", effective[0]["email"])
+        payload = monthly.build_feishu_checkpoint_card(
+            "2026-09", rows, 20, "2026-09-08", subscription_roster=roster,
+        )
+        card_text = "\n".join(self.card_contents(payload["card"]))
+        self.assertIn("当前套餐用户", card_text)
+        self.assertIn("Pro+", card_text)
+        self.assertIn("**$40.00**", card_text)
+        self.assertIn("当前 2.5%", card_text)
+        self.assertIn("预计月末 **9.4%**", card_text)
+        self.assertIn("订阅套餐以当前权威快照为准", card_text)
+        self.assertTrue(effective[0]["checkpoint_subscription_tier_authoritative"])
+
+        zero_rows = [
+            dict(rows[0], credits=0, usage_rate=Decimal(0), color="red"),
+            {
+                "user_id": "missing-user", "user_name": "未覆盖用户",
+                "month_end_tier": "Pro", "credits": 0, "capacity": 1000,
+                "usage_rate": Decimal(0), "color": "red", "estimated_plan_cost": 20,
+            },
+        ]
+        unknown_roster = {"tier-user": {
+            "subscription_tier": "Unknown", "user_name": "权威姓名",
+            "email": "authoritative@example.com",
+        }}
+        unknown_effective = monthly.apply_checkpoint_subscription_snapshot(
+            zero_rows, unknown_roster,
+        )
+        self.assertEqual("权威姓名", unknown_effective[0]["user_name"])
+        self.assertEqual("authoritative@example.com", unknown_effective[0]["email"])
+        self.assertEqual("Pro", unknown_effective[0]["month_end_tier"])
+        self.assertFalse(unknown_effective[0]["checkpoint_subscription_tier_authoritative"])
+        for incomplete_roster in (unknown_roster, {}, {"other-user": roster["tier-user"]}):
+            fallback = monthly.build_feishu_checkpoint_card(
+                "2026-09", zero_rows, 10, "2026-09-08",
+                subscription_roster=incomplete_roster,
+            )
+            fallback_text = "\n".join(self.card_contents(fallback["card"]))
+            self.assertIn("订阅套餐以该数据截止日的最新可用记录为准", fallback_text)
+            self.assertNotIn("订阅套餐以当前权威快照为准", fallback_text)
+        mixed = monthly.build_feishu_checkpoint_card(
+            "2026-09", zero_rows, 10, "2026-09-08",
+            subscription_roster=roster,
+        )
+        mixed_text = "\n".join(self.card_contents(mixed["card"]))
+        self.assertIn("订阅套餐部分来自当前权威快照", mixed_text)
+        self.assertIn("其余以该数据截止日最新记录为准", mixed_text)
+
+    def test_checkpoint_context_audit_keys_and_csv(self):
+        context = monthly.select_checkpoint_context({
+            "checkpoint_day": 10, "time": "2026-09-30T17:00:00Z", "notify": "true",
+        })
+        self.assertEqual("2026-10", context["month"])
+        self.assertEqual(10, context["checkpoint_day"])
+        self.assertTrue(context["notify"])
+        explicit = monthly.select_checkpoint_context({
+            "checkpoint_day": "20", "month": "2026-09", "notify": False,
+        })
+        self.assertEqual("2026-09", explicit["month"])
+        with self.assertRaisesRegex(ValueError, "checkpoint_day"):
+            monthly.select_checkpoint_context({"checkpoint_day": 15})
+        keys = monthly.checkpoint_audit_keys(
+            "dashboard-reports/private/kiro-monthly-checkpoints/", "2026-09", 10,
+        )
+        self.assertEqual(
+            "dashboard-reports/private/kiro-monthly-checkpoints/2026/09/kiro-checkpoint-2026-09-day-10.json",
+            keys["json"],
+        )
+        snapshot = monthly.select_checkpoint_risks("2026-09", [{
+            "user_id": "u1", "user_name": "=公式用户", "month_end_tier": "Pro",
+            "credits": 0, "capacity": 1000, "usage_rate": 0,
+            "estimated_plan_cost": 20,
+        }], 10, "2026-09-08")
+        records = monthly.checkpoint_audit_records(snapshot)
+        self.assertEqual("zero", records[0]["risk_type"])
+        self.assertEqual("latest_at_data_cutoff", records[0]["subscription_tier_source"])
+        csv_text = monthly.checkpoint_audit_csv(records).decode("utf-8-sig")
+        self.assertIn("month,checkpoint_day,data_cutoff,risk_type", csv_text)
+        self.assertIn("'=公式用户", csv_text)
+        cutoff_sql = monthly.build_data_cutoff_sql("kiro_analytics", "2026-09")
+        self.assertIn("MAX(TRY(date_parse", cutoff_sql)
+        self.assertIn("2026-09-01 00:00:00", cutoff_sql)
+        self.assertIn("2026-10-01 00:00:00", cutoff_sql)
+        bounded_usage = monthly.build_usage_sql("kiro_analytics", "2026-09", "2026-09-08")
+        bounded_latest = monthly.build_latest_tiers_sql("kiro_analytics", "2026-09-08")
+        self.assertIn("2026-09-09 00:00:00", bounded_usage)
+        self.assertNotIn("2026-10-01 00:00:00", bounded_usage)
+        self.assertIn("2026-09-09 00:00:00", bounded_latest)
+        marker = monthly.checkpoint_notification_marker_key(
+            "dashboard-reports/private/kiro-monthly-checkpoints", "2026-09", 10, "prod",
+        )
+        self.assertTrue(marker.endswith("day-10-notification-prod.json"))
+        s3 = Mock()
+        self.assertTrue(monthly._put_once(s3, "bucket", marker, b"{}", "application/json"))
+        self.assertEqual("*", s3.put_object.call_args.kwargs["IfNoneMatch"])
+        precondition = RuntimeError("exists")
+        precondition.response = {
+            "Error": {"Code": "PreconditionFailed"},
+            "ResponseMetadata": {"HTTPStatusCode": 412},
+        }
+        s3.put_object.side_effect = precondition
+        self.assertFalse(monthly._put_once(s3, "bucket", marker, b"{}", "application/json"))
+
+    def test_checkpoint_handler_persists_audit_and_notifies_only_on_risk(self):
+        clients = {
+            "s3": Mock(), "athena": Mock(), "sso": Mock(), "identity": Mock(), "secrets": Mock(),
+        }
+        config = {
+            "data_bucket": "data-bucket", "report_bucket": "report-bucket",
+            "database": "kiro_analytics", "workgroup": "workgroup",
+            "identity_store_id": "store", "application_arn": "app",
+            "subscription_csv_key": "", "identity_mapping_key": "mapping.csv",
+            "checkpoint_output_prefix": "dashboard-reports/private/kiro-monthly-checkpoints",
+            "feishu_dev_secret_arn": "arn:dev", "feishu_prod_secret_arn": "arn:prod",
+        }
+        zero_usage = [{
+            "user_id": "u1", "credits": "0", "overage": "0", "first_active": "",
+            "last_active": "", "active_days": "0", "tier_history": "Pro", "latest_tier": "Pro",
+        }]
+        roster = {"u1": {
+            "userid": "u1", "user_name": "风险用户", "subscription_status": "ACTIVE",
+            "subscription_tier": "Pro", "plan_source": "IIC direct assignment",
+        }}
+        with patch.object(monthly, "run_athena_query", side_effect=[
+            [{"data_cutoff": "2026-09-08 00:00:00.000"}], zero_usage,
+            [{"user_id": "u1", "latest_tier": "Pro"}],
+        ]), patch.object(monthly, "load_csv_roster", return_value=(None, False)),                 patch.object(monthly, "resolve_application_roster", return_value=roster),                 patch.object(monthly, "load_identity_mapping", return_value={}),                 patch.object(monthly, "send_feishu_channels", return_value={"prod": None}) as send:
+            result = monthly.handle_checkpoint({
+                "checkpoint_day": 10, "month": "2026-09", "notify": True,
+                "notification_channel": "prod", "time": "2026-09-10T01:00:00Z",
+            }, clients, config)
+        self.assertEqual("RISK", result["status"])
+        self.assertEqual("checkpoint_day10", result["report_type"])
+        self.assertEqual("2026-09-08", result["data_cutoff"])
+        self.assertEqual(1, result["zero_users"])
+        self.assertTrue(result["notification_attempted"])
+        self.assertEqual(["prod"], result["notification_channels"])
+        self.assertEqual({"prod": None}, result["notification_results"])
+        self.assertEqual(4, clients["s3"].put_object.call_count)
+        marker_put = clients["s3"].put_object.call_args_list[2]
+        self.assertEqual("*", marker_put.kwargs["IfNoneMatch"])
+        self.assertTrue(marker_put.kwargs["Key"].endswith("day-10-notification-prod.json"))
+        for call in clients["s3"].put_object.call_args_list:
+            self.assertEqual("AES256", call.kwargs["ServerSideEncryption"])
+            self.assertTrue(call.kwargs["Key"].startswith(
+                "dashboard-reports/private/kiro-monthly-checkpoints/",
+            ))
+        final_audit = json.loads(clients["s3"].put_object.call_args_list[-1].kwargs["Body"])
+        self.assertEqual("RISK", final_audit["status"])
+        self.assertEqual({"prod": None}, final_audit["notification_results"])
+        self.assertEqual(1, len(final_audit["risks"]))
+        sent_card = send.call_args.args[-1]
+        self.assertEqual("yellow", sent_card["card"]["header"]["template"])
+
+        clients["s3"].reset_mock()
+        high_usage = [dict(zero_usage[0], credits="600", active_days="8")]
+        with patch.object(monthly, "run_athena_query", side_effect=[
+            [{"data_cutoff": "2026-09-08 00:00:00.000"}], high_usage,
+            [{"user_id": "u1", "latest_tier": "Pro"}],
+        ]), patch.object(monthly, "load_csv_roster", return_value=(None, False)),                 patch.object(monthly, "resolve_application_roster", return_value=roster),                 patch.object(monthly, "load_identity_mapping", return_value={}),                 patch.object(monthly, "send_feishu_channels") as send:
+            silent = monthly.handle_checkpoint({
+                "checkpoint_day": 20, "month": "2026-09", "notify": True,
+                "notification_channel": "prod", "time": "2026-09-20T01:00:00Z",
+            }, clients, config)
+        self.assertEqual("SILENT_NO_RISK", silent["status"])
+        self.assertFalse(silent["notification_attempted"])
+        self.assertEqual(2, clients["s3"].put_object.call_count)
+        send.assert_not_called()
+
+    def test_checkpoint_iic_group_tier_precedence_and_direct_fallback(self):
+        rows = [{
+            "user_id": "u1", "user_name": "用户", "month_end_tier": "Pro",
+            "credits": 50, "capacity": 1000, "usage_rate": Decimal("0.05"),
+            "estimated_plan_cost": 20, "unused_capacity_value": 19,
+        }]
+        group = monthly.apply_checkpoint_iic_group_tiers(rows, {"u1": {
+            "subscription_tier": "Pro+", "plan_source": "IIC group",
+        }})
+        self.assertEqual("Pro+", group[0]["month_end_tier"])
+        self.assertEqual(2000, group[0]["capacity"])
+        self.assertEqual(40, group[0]["estimated_plan_cost"])
+        self.assertEqual("current_iic_group", group[0]["checkpoint_subscription_tier_source"])
+        direct = monthly.apply_checkpoint_iic_group_tiers(rows, {"u1": {
+            "subscription_tier": "Pro+", "plan_source": "IIC direct assignment",
+        }})
+        self.assertEqual("Pro", direct[0]["month_end_tier"])
+        self.assertEqual(1000, direct[0]["capacity"])
+        self.assertEqual("latest_at_data_cutoff", direct[0]["checkpoint_subscription_tier_source"])
+        self.assertEqual("Pro", rows[0]["month_end_tier"])
+
+    def test_checkpoint_duplicate_delivery_is_at_most_once_after_audit_update_failure(self):
+        clients = {
+            "s3": Mock(), "athena": Mock(), "sso": Mock(), "identity": Mock(), "secrets": Mock(),
+        }
+        config = {
+            "data_bucket": "data", "report_bucket": "report", "database": "db",
+            "workgroup": "wg", "identity_store_id": "store", "application_arn": "app",
+            "subscription_csv_key": "", "identity_mapping_key": "mapping.csv",
+            "checkpoint_output_prefix": "dashboard-reports/private/kiro-monthly-checkpoints",
+            "feishu_dev_secret_arn": "arn:dev", "feishu_prod_secret_arn": "arn:prod",
+        }
+        query_cycle = [
+            [{"data_cutoff": "2026-09-08 00:00:00.000"}],
+            [{
+                "user_id": "u1", "credits": "0", "overage": "0", "first_active": "",
+                "last_active": "", "active_days": "0", "tier_history": "Pro", "latest_tier": "Pro",
+            }],
+            [{"user_id": "u1", "latest_tier": "Pro"}],
+        ]
+        roster = {"u1": {
+            "userid": "u1", "user_name": "风险用户", "subscription_status": "ACTIVE",
+            "subscription_tier": "Pro", "plan_source": "IIC direct assignment",
+        }}
+        put_count = 0
+        def flaky_put(*args, **kwargs):
+            nonlocal put_count
+            put_count += 1
+            if put_count == 3:
+                raise RuntimeError("simulated post-send audit failure")
+        event = {
+            "checkpoint_day": 10, "month": "2026-09", "notify": True,
+            "notification_channel": "prod", "time": "2026-09-10T01:00:00Z",
+        }
+        with patch.object(monthly, "run_athena_query", side_effect=query_cycle + query_cycle),                 patch.object(monthly, "load_csv_roster", return_value=(None, False)),                 patch.object(monthly, "resolve_application_roster", return_value=roster),                 patch.object(monthly, "load_identity_mapping", return_value={}),                 patch.object(monthly, "_put_once", side_effect=[True, False]),                 patch.object(monthly, "_put", side_effect=flaky_put),                 patch.object(monthly, "send_feishu_channels", return_value={"prod": None}) as send:
+            first = monthly.handle_checkpoint(event, clients, config)
+            second = monthly.handle_checkpoint(event, clients, config)
+        self.assertIn("audit_update_error", first)
+        self.assertTrue(first["notification_attempted"])
+        self.assertFalse(second["notification_attempted"])
+        self.assertEqual(["prod"], second["notification_skipped_channels"])
+        self.assertEqual(1, send.call_count)
+
+    def test_day10_checkpoint_zero_only_card_and_silent_branch(self):
+        rows = [
+            {
+                "user_id": "zero", "user_name": "未启动用户", "month_end_tier": "Pro+",
+                "credits": 0, "capacity": 2000, "usage_rate": Decimal(0),
+                "estimated_plan_cost": 40,
+            },
+            {
+                "user_id": "tiny", "user_name": "已启动用户", "month_end_tier": "Pro",
+                "credits": 1, "capacity": 1000, "usage_rate": Decimal("0.001"),
+                "estimated_plan_cost": 20,
+            },
+        ]
+        snapshot = monthly.select_checkpoint_risks("2026-09", rows, 10, "2026-09-08")
+        self.assertEqual(["zero"], [row["user_id"] for row in snapshot["zero_rows"]])
+        self.assertEqual([], snapshot["projected_low_rows"])
+        self.assertEqual(1, snapshot["risk_count"])
+        self.assertEqual(Decimal("40"), snapshot["risk_cost"])
+
+        payload = monthly.build_feishu_checkpoint_card(
+            "2026-09", rows, 10, "2026-09-08", preview=True,
+        )
+        card = payload["card"]
+        self.assertEqual("2.0", card["schema"])
+        self.assertTrue(card["config"]["update_multi"])
+        self.assertEqual("fill", card["config"]["width_mode"])
+        self.assertEqual("yellow", card["header"]["template"])
+        self.assertEqual("Kiro 用量简报 · 每月10日启动提醒", card["header"]["title"]["content"])
+        self.assertEqual("2026-09 自然月 · 累计口径 · 数据截至 2026-09-08", card["header"]["subtitle"]["content"])
+        self.assertEqual(
+            [("grey", "效果预览"), ("yellow", "启动提醒")],
+            [(tag["color"], tag["text"]["content"]) for tag in card["header"]["text_tag_list"]],
+        )
+        colors = card["config"]["style"]["color"]
+        self.assertEqual({"neutral_bg", "panel_bg", "border_soft", "advice_bg"}, set(colors))
+        for token in colors.values():
+            self.assertEqual({"light_mode", "dark_mode"}, set(token))
+            self.assertNotEqual(token["light_mode"], token["dark_mode"])
+        self.assertEqual("rgba(143,105,22,0.10)", colors["advice_bg"]["light_mode"])
+        self.assertEqual("rgba(221,173,72,0.14)", colors["advice_bg"]["dark_mode"])
+        elements = card["body"]["elements"]
+        self.assertEqual(2, len(elements[0]["columns"]))
+        self.assertEqual("stretch", elements[1]["flex_mode"])
+        self.assertEqual(1, len(elements[1]["columns"]))
+        initial_text = "\n".join(self.card_contents(elements[:3]))
+        self.assertIn("月度进度\n**30%**\n███░░░░░░░", initial_text)
+        self.assertIn("尚未使用\n**1 人**", initial_text)
+        self.assertIn("风险订阅成本\n**$40.00**", initial_text)
+        self.assertIn("本月进度已达 **30%**", initial_text)
+        self.assertIn("订阅用户尚未使用 Kiro", initial_text)
+        self.assertNotIn("第 10 天检查点", initial_text)
+        self.assertNotIn("预测低利用率", initial_text)
+        self.assertNotIn("1/3", initial_text)
+        self.assertIn(
+            "订阅套餐以该数据截止日的最新可用记录为准",
+            "\n".join(self.card_contents(card)),
+        )
+        panel = self.find_card_element(card, "checkpoint_zero_users")
+        self.assertFalse(panel["expanded"])
+        panel_text = "\n".join(self.card_contents(panel))
+        self.assertIn("未启动用户", panel_text)
+        self.assertNotIn("已启动用户", panel_text)
+        rendered = json.dumps(card, ensure_ascii=False)
+        self.assertNotIn("预测低", rendered)
+        self.assertNotIn('"tag": "button"', rendered)
+        self.assertNotIn("card_link", card)
+        self.assertNotIn("完整 Excel", rendered)
+        self.assertLessEqual(self.card_component_count(card), 200)
+        self.assertLess(len(json.dumps(payload, ensure_ascii=False).encode("utf-8")), 20000)
+
+        self.assertIsNone(monthly.build_feishu_checkpoint_card(
+            "2026-09", [rows[1]], 10, "2026-09-08",
+        ))
+
+    def test_day20_checkpoint_disjoint_projected_low_and_collapsed_panels(self):
+        rows = [
+            {
+                "user_id": "zero", "user_name": "零使用用户", "month_end_tier": "Pro",
+                "credits": 0, "capacity": 1000, "usage_rate": Decimal(0),
+                "estimated_plan_cost": 20,
+            },
+            {
+                "user_id": "low", "user_name": "预测低用用户", "month_end_tier": "Pro+",
+                "credits": 40, "capacity": 2000, "usage_rate": Decimal("0.02"),
+                "estimated_plan_cost": 40,
+            },
+            {
+                "user_id": "ok", "user_name": "预测正常用户", "month_end_tier": "Pro",
+                "credits": 30, "capacity": 1000, "usage_rate": Decimal("0.03"),
+                "estimated_plan_cost": 20,
+            },
+            {
+                "user_id": "unknown", "user_name": "未知套餐用户", "month_end_tier": "Unknown",
+                "credits": 1, "capacity": 0, "usage_rate": Decimal(0),
+                "estimated_plan_cost": 0,
+            },
+        ]
+        snapshot = monthly.select_checkpoint_risks("2026-09", rows, 20, "2026-09-08")
+        zero_ids = {row["user_id"] for row in snapshot["zero_rows"]}
+        low_ids = {row["user_id"] for row in snapshot["projected_low_rows"]}
+        self.assertEqual({"zero"}, zero_ids)
+        self.assertEqual({"low"}, low_ids)
+        self.assertTrue(zero_ids.isdisjoint(low_ids))
+        self.assertEqual(Decimal("0.075"), snapshot["projected_low_rows"][0]["projected_usage_rate"])
+        self.assertEqual(Decimal("60"), snapshot["risk_cost"])
+
+        payload = monthly.build_feishu_checkpoint_card(
+            "2026-09", rows, 20, "2026-09-08", preview=True,
+        )
+        card = payload["card"]
+        self.assertEqual("red", card["header"]["template"])
+        self.assertEqual("Kiro 用量简报 · 每月20日风险提醒", card["header"]["title"]["content"])
+        self.assertEqual(
+            [("grey", "效果预览"), ("red", "零使用 1"), ("orange", "预测低用 1")],
+            [(tag["color"], tag["text"]["content"]) for tag in card["header"]["text_tag_list"]],
+        )
+        colors = card["config"]["style"]["color"]
+        self.assertEqual("rgba(245,63,63,0.10)", colors["advice_bg"]["light_mode"])
+        self.assertEqual("rgba(255,92,92,0.14)", colors["advice_bg"]["dark_mode"])
+        initial_text = "\n".join(self.card_contents(card["body"]["elements"][:3]))
+        self.assertIn("月度进度\n**60%**\n██████░░░░", initial_text)
+        self.assertIn("预测低利用率\n**1 人**", initial_text)
+        self.assertIn("本月进度已达 **60%**", initial_text)
+        self.assertNotIn("第 20 天检查点", initial_text)
+        self.assertNotIn("2/3", initial_text)
+        zero = self.find_card_element(card, "checkpoint_zero_users")
+        low = self.find_card_element(card, "checkpoint_projected_low_users")
+        self.assertFalse(zero["expanded"])
+        self.assertFalse(low["expanded"])
+        low_text = "\n".join(self.card_contents(low))
+        self.assertIn("预测低用用户", low_text)
+        self.assertIn("当前 2.0%", low_text)
+        self.assertIn("预计月末 **7.5%**", low_text)
+        self.assertNotIn("零使用用户", low_text)
+        self.assertNotIn("预测正常用户", low_text)
+        all_card_text = "\n".join(self.card_contents(card))
+        self.assertIn("订阅套餐以该数据截止日的最新可用记录为准", all_card_text)
+        self.assertIn("÷ 截止日号 × 当月天数", all_card_text)
+        self.assertLessEqual(self.card_component_count(card), 200)
+        self.assertLess(len(json.dumps(payload, ensure_ascii=False).encode("utf-8")), 20000)
+
+        no_risk = [dict(rows[2], usage_rate=Decimal("0.5"), credits=500)]
+        self.assertIsNone(monthly.build_feishu_checkpoint_card(
+            "2026-09", no_risk, 20, "2026-09-08",
+        ))
+
+    def test_checkpoint_card_retains_all_risk_users_with_constant_components(self):
+        rows = self.card_rows()
+        for row in rows:
+            row.update({"credits": 0, "usage_rate": Decimal(0), "color": "red"})
+        payload = monthly.build_feishu_checkpoint_card("2026-09", rows, 10, "2026-09-08")
+        card = payload["card"]
+        panel = self.find_card_element(card, "checkpoint_zero_users")
+        self.assertFalse(panel["expanded"])
+        text = "\n".join(self.card_contents(panel))
+        for row in rows:
+            expected = row["user_name"] if row["user_name"] != row["user_id"] else row["user_id"][-8:]
+            self.assertIn(expected, text)
+        self.assertLessEqual(self.card_component_count(card), 40)
+        self.assertLess(len(json.dumps(payload, ensure_ascii=False).encode("utf-8")), 20000)
+
     def test_feishu_card_v2_content_layout_and_sorting(self):
         url = "http://example.invalid/report.xlsx"
         payload = monthly.build_feishu_card("2026-07", self.card_rows(), url)
@@ -532,7 +1005,32 @@ class MonthlyReportTests(unittest.TestCase):
         self.assertIn("MonthlyFinalNotificationChannel:", template)
         self.assertIn('"notify": ${MonthlyFinalNotificationEnabled}', template)
         self.assertIn('"notification_channel": "${MonthlyFinalNotificationChannel}"', template)
+        self.assertIn("MonthlyDay10NotificationEnabled:", template)
+        self.assertIn("MonthlyDay20NotificationEnabled:", template)
+        self.assertIn("MonthlyDay10NotificationChannel:", template)
+        self.assertIn("MonthlyDay20NotificationChannel:", template)
+        self.assertIn("MonthlyDay10ScheduleRule:", template)
+        self.assertIn("MonthlyDay20ScheduleRule:", template)
+        self.assertIn("cron(0 1 10 * ? *)", template)
+        self.assertIn("cron(0 1 20 * ? *)", template)
+        self.assertIn('"checkpoint_day": 10', template)
+        self.assertIn('"checkpoint_day": 20', template)
+        self.assertIn("CHECKPOINT_OUTPUT_PREFIX: !Ref CheckpointOutputPrefix", template)
+        self.assertIn("AllowedPattern: '^dashboard-reports/private/.+'", template)
+        self.assertIn("${ReportBucket}/${CheckpointOutputPrefix}/*", template)
         self.assertNotIn("FEISHU_SECRET_ARN:", template)
+        with open(os.path.join(ROOT, "deploy.sh"), encoding="utf-8") as deploy_file:
+            deploy = deploy_file.read()
+        self.assertIn("day10_notification_enabled", deploy)
+        self.assertIn("day20_notification_enabled", deploy)
+        self.assertIn('MonthlyDay10NotificationChannel="$MONTHLY_DAY10_NOTIFICATION_CHANNEL"', deploy)
+        self.assertIn('MonthlyDay20NotificationChannel="$MONTHLY_DAY20_NOTIFICATION_CHANNEL"', deploy)
+        with open(os.path.join(ROOT, "config.example.yaml"), encoding="utf-8") as config_file:
+            example = config_file.read()
+        self.assertIn("day10_notification_enabled: false", example)
+        self.assertIn("day20_notification_enabled: false", example)
+        self.assertIn('day10_notification_channel: "dev"', example)
+        self.assertIn('day20_notification_channel: "dev"', example)
         self.assertEqual(
             {
                 "month": "2026-07", "report_type": "final", "notify": True,

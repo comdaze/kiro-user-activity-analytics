@@ -72,6 +72,39 @@ Parameters:
     Default: dev
     AllowedValues: [dev, prod, both]
     Description: Explicit Feishu channel used by the final schedule
+  CheckpointOutputPrefix:
+    Type: String
+    Default: dashboard-reports/private/kiro-monthly-checkpoints
+    AllowedPattern: '^dashboard-reports/private/.+'
+    Description: Private S3 prefix for lightweight day-10/day-20 checkpoint audit JSON and CSV
+  MonthlyDay10Schedule:
+    Type: String
+    Default: 'cron(0 1 10 * ? *)'
+    Description: Day-10 checkpoint schedule (UTC 01:00 / Beijing 09:00)
+  MonthlyDay20Schedule:
+    Type: String
+    Default: 'cron(0 1 20 * ? *)'
+    Description: Day-20 checkpoint schedule (UTC 01:00 / Beijing 09:00)
+  MonthlyDay10NotificationEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Explicit switch controlling whether the day-10 checkpoint sends Feishu
+  MonthlyDay10NotificationChannel:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod, both]
+    Description: Explicit Feishu channel used by the day-10 checkpoint
+  MonthlyDay20NotificationEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Explicit switch controlling whether the day-20 checkpoint sends Feishu
+  MonthlyDay20NotificationChannel:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod, both]
+    Description: Explicit Feishu channel used by the day-20 checkpoint
 
 Conditions:
   HasFeishuDevSecret: !Not [!Equals [!Ref FeishuDevSecretArn, '']]
@@ -593,6 +626,7 @@ Resources:
                 Resource:
                   - !Sub 'arn:aws:s3:::${S3BucketName}/athena-results/*'
                   - !Sub 'arn:aws:s3:::${ReportBucket}/${MonthlyOutputPrefix}/*'
+                  - !Sub 'arn:aws:s3:::${ReportBucket}/${CheckpointOutputPrefix}/*'
               - Effect: Allow
                 Action:
                   - glue:GetDatabase
@@ -660,6 +694,7 @@ Resources:
           FEISHU_DEV_SECRET_ARN: !Ref FeishuDevSecretArn
           FEISHU_PROD_SECRET_ARN: !Ref FeishuProdSecretArn
           MONTHLY_OUTPUT_PREFIX: !Ref MonthlyOutputPrefix
+          CHECKPOINT_OUTPUT_PREFIX: !Ref CheckpointOutputPrefix
           AWS_REGION_NAME: !Ref AWS::Region
 
   MonthlyReportLogGroup:
@@ -704,6 +739,42 @@ Resources:
             MaximumEventAgeInSeconds: 86400
             MaximumRetryAttempts: 2
 
+  MonthlyDay10ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: kiro-monthly-credits-day10
+      Description: Current-month day-10 startup checkpoint with independent notification control
+      ScheduleExpression: !Ref MonthlyDay10Schedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt MonthlyReportFunction.Arn
+          Id: MonthlyDay10Target
+          InputTransformer:
+            InputPathsMap:
+              eventTime: $.time
+            InputTemplate: !Sub '{"time": <eventTime>, "checkpoint_day": 10, "notify": ${MonthlyDay10NotificationEnabled}, "notification_channel": "${MonthlyDay10NotificationChannel}"}'
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 86400
+            MaximumRetryAttempts: 2
+
+  MonthlyDay20ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: kiro-monthly-credits-day20
+      Description: Current-month day-20 risk checkpoint with independent notification control
+      ScheduleExpression: !Ref MonthlyDay20Schedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt MonthlyReportFunction.Arn
+          Id: MonthlyDay20Target
+          InputTransformer:
+            InputPathsMap:
+              eventTime: $.time
+            InputTemplate: !Sub '{"time": <eventTime>, "checkpoint_day": 20, "notify": ${MonthlyDay20NotificationEnabled}, "notification_channel": "${MonthlyDay20NotificationChannel}"}'
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 86400
+            MaximumRetryAttempts: 2
+
   MonthlyProvisionalLambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -719,6 +790,22 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt MonthlyFinalScheduleRule.Arn
+
+  MonthlyDay10LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MonthlyReportFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonthlyDay10ScheduleRule.Arn
+
+  MonthlyDay20LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MonthlyReportFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonthlyDay20ScheduleRule.Arn
 
 Outputs:
   GlueDatabaseName:

@@ -48,6 +48,14 @@ monthly_report:
   # 生产示例：final_notification_enabled: true + final_notification_channel: "prod"
   final_notification_enabled: false
   final_notification_channel: "dev"
+  # 10日/20日简报独立控制；示例安全默认关闭，生产启用时通常选择 prod
+  day10_notification_enabled: false
+  day10_notification_channel: "dev"
+  day20_notification_enabled: false
+  day20_notification_channel: "dev"
   output_prefix: "dashboard-reports/public/kiro-monthly"
+  checkpoint_output_prefix: "dashboard-reports/private/kiro-monthly-checkpoints"
   provisional_schedule: "cron(0 6 1 * ? *)"  # 每月 1 日 UTC 06:00，不通知
   final_schedule: "cron(0 6 2 * ? *)"        # 每月 2 日 UTC 06:00；是否通知由上方开关控制
+  day10_schedule: "cron(0 1 10 * ? *)"       # 每月10日 UTC 01:00（北京时间09:00）
+  day20_schedule: "cron(0 1 20 * ? *)"       # 每月20日 UTC 01:00（北京时间09:00）
